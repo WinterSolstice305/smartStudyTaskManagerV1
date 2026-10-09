@@ -151,7 +151,10 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
+**/*firebase-adminsdk*.json
 .venv
 env/
 venv/

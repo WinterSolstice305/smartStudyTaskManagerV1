@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "780616446732",
+    "project_id": "smartstudytaskmanagerv1",
+    "storage_bucket": "smartstudytaskmanagerv1.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:780616446732:android:75e5cc040b9a5327a20f29",
+        "android_client_info": {
+          "package_name": "com.WS305.sstm"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB-wqVqQEEfA4xaBy6vwHT5bQO9y7Iy_c4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

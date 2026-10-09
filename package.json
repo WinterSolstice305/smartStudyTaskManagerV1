@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "scripts": {
+    "test": "npx --yes firebase-tools@14.23.0 emulators:exec --only firestore --project demo-smart-study-task-manager \"node --test tests/firestore_rules.test.mjs\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^6.0.0",
+    "firebase": "^13.0.0"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.14.5"
+  }
+}
