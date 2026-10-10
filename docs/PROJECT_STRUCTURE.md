@@ -1,0 +1,225 @@
+# Project structure
+
+This repository is a compact Python/Flet application. The significant runtime code is under `app/`, with the entry point in the repo root and unit tests under `tests/`.
+
+## Repository tree
+
+```text
+.
+├── .env.example
+├── .gitignore
+├── README.md
+├── firebase.json
+├── firestore.rules
+├── main.py
+├── package.json
+├── pyproject.toml
+├── requirements.txt
+├── app/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── common.py
+│   │   ├── subject.py
+│   │   └── task.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── firebase_auth.py
+│   │   ├── firestore.py
+│   │   ├── gemini.py
+│   │   ├── subject_service.py
+│   │   └── task_service.py
+│   └── ui/
+│       ├── __init__.py
+│       ├── home.py
+│       ├── login.py
+│       ├── register.py
+│       ├── task_views.py
+│       └── workspace.py
+├── tests/
+│   ├── __init__.py
+│   ├── firestore_rules.test.mjs
+│   ├── test_firebase_auth.py
+│   ├── test_firestore.py
+│   ├── test_gemini.py
+│   ├── test_models_services.py
+│   └── test_task_views.py
+└── docs/
+    ├── ARCHITECTURE.md
+    ├── DATA_MODEL.md
+    ├── FIREBASE_AND_SECURITY.md
+    ├── PROJECT_STRUCTURE.md
+    ├── SETUP.md
+    └── README.md
+```
+
+The tree above excludes generated folders such as `.venv/`, `build/`, and `node_modules/` because they are tooling artifacts and not source-of-truth project code.
+
+## Root-level files and folders
+
+### `main.py`
+
+Entry point for the application. It creates the auth service, the workspace, and the routing callbacks for login/register/home screens.
+
+### `README.md`
+
+The developer-facing overview and quick-start instructions. This repository has a README, but it is not the complete project documentation; the docs folder supplements it.
+
+### `pyproject.toml`
+
+Declares the Python project metadata and an upper-level requirement of `>=3.14`.
+
+### `requirements.txt`
+
+The Python dependency manifest used for standard installation. It includes:
+
+- `flet==1.0.3`
+- `google-genai>=1.0.0,<3.0.0`
+- `python-dotenv>=1.0.0,<2.0.0`
+
+### `firebase.json`
+
+Firebase configuration file that points at `firestore.rules` and defines the local Firestore emulator port.
+
+### `firestore.rules`
+
+Rules file enabling UID-scoped access for each authenticated user under `/users/{userId}`.
+
+### `package.json`
+
+Node-based tooling for Firebase rules tests. It executes Firestore rules tests with `firebase-tools` and `@firebase/rules-unit-testing`.
+
+### `.env.example`
+
+Sanitized template for required environment variables.
+
+## `app/`
+
+### `app/config.py`
+
+Reads Firebase and Gemini environment variables. It also contains default placeholder values, which should not be treated as production-safe configuration.
+
+### `app/models/`
+
+Contains the domain models and validation helpers.
+
+#### `app/models/common.py`
+
+Defines:
+
+- `require_text()`
+- `parse_datetime()`
+- `parse_optional_datetime()`
+- `now_utc()`
+
+These are shared by the domain models so that timestamps and values are normalized consistently.
+
+#### `app/models/subject.py`
+
+Defines the `Subject` dataclass. It validates IDs, titles, color values, descriptions, and timestamps before serializing to Firestore.
+
+#### `app/models/task.py`
+
+Defines the `Task` dataclass. It covers deadlines, status, priority, category, tags, and timestamps.
+
+#### `app/models/__init__.py`
+
+Defines `ModelValidationError` and `DocumentNotFoundError` used across the app.
+
+## `app/services/`
+
+### `app/services/firebase_auth.py`
+
+Wraps Firebase Identity Toolkit calls for sign up and login. It also translates common Firebase API failures into readable user messages.
+
+This is the only authentication implementation in the app and is used by the UI and Firestore service.
+
+### `app/services/firestore.py`
+
+Provides a typed REST wrapper around Firestore. It validates document IDs, scopes paths to a user, encodes Python data to Firestore field representations, and reads lists and individual documents.
+
+This is a core runtime dependency for all task and subject persistence.
+
+### `app/services/subject_service.py`
+
+A service wrapper around subjects. It validates updates, checks for task references before deletion, and raises `SubjectInUseError` when the subject is still assigned.
+
+### `app/services/task_service.py`
+
+A service wrapper for task CRUD. It ensures the assigned subject exists when creating or reassigning a task, performs update validation, and leaves `updated_at` in sync.
+
+### `app/services/gemini.py`
+
+Implements the AI planner functionality. It contains:
+
+- `generate_task_recommendations()`
+- `chat_about_tasks()`
+- Gemini request formatting and error handling
+- local deadline sorting utilities
+
+This is read-only: it takes the task snapshot and returns recommendations or an answer without mutating Firestore data.
+
+## `app/ui/`
+
+### `app/ui/login.py`
+
+The signed-out login screen. It collects email and password, triggers Firebase login, and then calls the authentication callback.
+
+### `app/ui/register.py`
+
+The registration screen. It validates the email/password form and calls Firebase registration.
+
+### `app/ui/workspace.py`
+
+The main screen manager and primary UI controller. It owns the dashboard, tasks view, calendar, settings, profile data, filters, and AI controls.
+
+This is the most important file in `app/ui` and is the central orchestration layer for the app.
+
+### `app/ui/task_views.py`
+
+Contains task filtering, sorting, and calendar helpers used by the workspace.
+
+### `app/ui/home.py`
+
+A simple logged-in page that is not the primary app route in the current implementation. It exists as a helper/screen, but the main application flow uses `StudyWorkspace` instead.
+
+## `tests/`
+
+The repo contains Python unit tests and a Firestore security rules test.
+
+### Python tests
+
+- `test_firebase_auth.py` verifies auth translation and token storage.
+- `test_firestore.py` verifies Firestore request scoping, malformed responses, and permission checks.
+- `test_gemini.py` verifies AI prompt context, rate-limit handling, and read-only behavior.
+- `test_models_services.py` verifies `Subject` and `Task` validation and CRUD logic.
+- `test_task_views.py` validates sorting/filtering utilities.
+
+### `firestore_rules.test.mjs`
+
+Validates the Firestore rules using `@firebase/rules-unit-testing`. This is the repo’s security-focused configuration test.
+
+## Active vs inactive code
+
+The code currently in active use includes:
+
+- `main.py`
+- `app/config.py`
+- `app/services/*`
+- `app/ui/workspace.py`
+- `app/models/*`
+- the tests under `tests/`
+
+The following are present but are not the primary runtime flow for the app as implemented:
+
+- `app/ui/home.py` is a screen helper rather than the active screen manager
+- the Flutter packaging directory under `build/flutter` is build infrastructure, not the runtime app source
+- `node_modules/` and `.venv/` are dependency artifacts and not part of the repository’s source design
+
+## Relevant current limitations
+
+- There is no backend service or persisted local state beyond Firestore + Firebase auth.
+- The app keeps auth state in memory only; reloading the app loses session state.
+- The project contains an actual Firebase API key default in `app/config.py` and should not be used in production.
+- Android packaging is present as a Flutter/Flet build layout, but there is no validated end-to-end APK build command checked in by the repo itself.

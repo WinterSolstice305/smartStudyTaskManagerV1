@@ -158,12 +158,31 @@ class StudyWorkspace:
         status_controls: list[ft.Control] = []
         if notice:
             status_controls.append(
-                ft.Text(notice, color=ft.Colors.GREEN_700, selectable=True)
+                ft.Text(notice, color=self._success_text_color(), selectable=True)
             )
         if error:
             status_controls.append(
-                ft.Text(error, color=ft.Colors.RED_700, selectable=True)
+                ft.Text(error, color=self._error_text_color(), selectable=True)
             )
+        home_action = (
+            ft.Container(
+                content=ft.Row(
+                    controls=[
+                        ft.FloatingActionButton(
+                            icon=ft.Icons.ADD,
+                            tooltip="Add Task",
+                            bgcolor=ft.Colors.BLUE_700,
+                            foreground_color=ft.Colors.WHITE,
+                            on_click=lambda _: self._show_task_dialog(),
+                        )
+                    ],
+                    alignment=ft.MainAxisAlignment.END,
+                ),
+                padding=ft.Padding(0, 0, 16, 8),
+            )
+            if self.route == "home"
+            else None
+        )
         self.page.clean()
         self.page.add(
             ft.Column(
@@ -171,12 +190,31 @@ class StudyWorkspace:
                     ft.Container(header, padding=ft.Padding(16, 12, 8, 8)),
                     *status_controls,
                     ft.Container(content=body, expand=True, padding=ft.Padding(16, 4, 16, 12)),
+                    *([home_action] if home_action is not None else []),
                     self._navigation_bar(),
                 ],
                 spacing=0,
                 expand=True,
             )
         )
+
+    def _surface_color(self) -> str:
+        return ft.Colors.GREY_900 if self.dark_mode else ft.Colors.GREY_100
+
+    def _raised_surface_color(self) -> str:
+        return ft.Colors.GREY_800 if self.dark_mode else ft.Colors.WHITE
+
+    def _accent_surface_color(self) -> str:
+        return ft.Colors.BLUE_900 if self.dark_mode else ft.Colors.BLUE_50
+
+    def _secondary_text_color(self) -> str:
+        return ft.Colors.GREY_400 if self.dark_mode else ft.Colors.GREY_700
+
+    def _error_text_color(self) -> str:
+        return ft.Colors.RED_300 if self.dark_mode else ft.Colors.RED_700
+
+    def _success_text_color(self) -> str:
+        return ft.Colors.GREEN_300 if self.dark_mode else ft.Colors.GREEN_700
 
     def _navigation_bar(self) -> ft.NavigationBar:
         selected_index = (
@@ -238,7 +276,7 @@ class StudyWorkspace:
                 ft.Container(
                     content=self._recommendation_panel(),
                     padding=16,
-                    bgcolor=ft.Colors.BLUE_50,
+                    bgcolor=self._accent_surface_color(),
                     border_radius=12,
                 ),
                 self._chat_panel(),
@@ -272,7 +310,7 @@ class StudyWorkspace:
                 )
             elif self._recommendation_error:
                 controls.append(
-                    ft.Text(self._recommendation_error, color=ft.Colors.RED_700)
+                    ft.Text(self._recommendation_error, color=self._error_text_color())
                 )
             elif self._recommendation_result is None:
                 controls.append(
@@ -303,7 +341,7 @@ class StudyWorkspace:
                                 spacing=4,
                             ),
                             padding=10,
-                            bgcolor=ft.Colors.WHITE,
+                            bgcolor=self._raised_surface_color(),
                             border_radius=8,
                         )
                         for recommendation in self._recommendation_result.recommendations
@@ -349,7 +387,7 @@ class StudyWorkspace:
         if self._chat_loading:
             controls.extend([ft.ProgressBar(), ft.Text("Thinking…")])
         elif self._chat_error:
-            controls.append(ft.Text(self._chat_error, color=ft.Colors.RED_700))
+            controls.append(ft.Text(self._chat_error, color=self._error_text_color()))
         elif self._chat_response:
             controls.append(ft.Text(self._chat_response, selectable=True))
         controls.extend(
@@ -386,7 +424,7 @@ class StudyWorkspace:
         return ft.Container(
             content=ft.Column(controls=controls, spacing=8),
             padding=16,
-            bgcolor=ft.Colors.BLUE_50,
+            bgcolor=self._accent_surface_color(),
             border_radius=12,
         )
 
@@ -596,6 +634,43 @@ class StudyWorkspace:
         self._active_task_list = task_list
         self._active_update_tasks = update_list
         update_list(update_page=False)
+        filter_section = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Row(
+                        controls=[
+                            ft.Text(
+                                "Filter and sort",
+                                size=17,
+                                weight=ft.FontWeight.BOLD,
+                                expand=True,
+                            ),
+                            ft.TextButton(
+                                "Reset",
+                                icon=ft.Icons.FILTER_ALT_OFF,
+                                tooltip="Reset filters and sorting",
+                                on_click=lambda _: self._reset_filters(),
+                            ),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.ResponsiveRow(
+                        controls=[
+                            ft.Container(control, col={"xs": 12, "md": 6})
+                            for control in filters
+                        ],
+                        columns=12,
+                        spacing=10,
+                        run_spacing=2,
+                    ),
+                    sort_control,
+                ],
+                spacing=6,
+            ),
+            padding=12,
+            bgcolor=self._surface_color(),
+            border_radius=12,
+        )
         return ft.ListView(
             controls=[
                 ft.Row(
@@ -613,22 +688,10 @@ class StudyWorkspace:
                         ),
                     ]
                 ),
-                ft.Text("Filter and sort", size=17, weight=ft.FontWeight.BOLD),
-                ft.ResponsiveRow(
-                    controls=[
-                        ft.Container(control, col={"xs": 12, "sm": 6})
-                        for control in filters
-                    ]
-                ),
-                sort_control,
-                ft.TextButton(
-                    "Reset filters",
-                    icon=ft.Icons.FILTER_ALT_OFF,
-                    on_click=lambda _: self._reset_filters(),
-                ),
+                filter_section,
                 task_list,
             ],
-            spacing=10,
+            spacing=8,
             expand=True,
         )
 
@@ -674,7 +737,7 @@ class StudyWorkspace:
                     spacing=3,
                 ),
                 padding=12,
-                bgcolor=ft.Colors.GREY_100,
+                bgcolor=self._surface_color(),
                 border_radius=10,
             )
         return ft.Container(
@@ -709,7 +772,7 @@ class StudyWorkspace:
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=8,
-            bgcolor=ft.Colors.GREY_100,
+            bgcolor=self._surface_color(),
             border_radius=10,
         )
 
@@ -725,6 +788,7 @@ class StudyWorkspace:
         await self.show(self.route, notice="Task status updated.")
 
     def _show_task_dialog(self, task: Task | None = None) -> None:
+        return_route = self.route
         title = ft.TextField(label="Task title", value=task.title if task else "")
         description = ft.TextField(
             label="Description",
@@ -773,7 +837,7 @@ class StudyWorkspace:
             label="Tags (comma-separated)",
             value=", ".join(task.tags) if task else "",
         )
-        error = ft.Text(color=ft.Colors.RED_700, visible=False)
+        error = ft.Text(color=self._error_text_color(), visible=False)
 
         async def save(_: Any) -> None:
             if not title.value or not title.value.strip():
@@ -808,7 +872,7 @@ class StudyWorkspace:
                 self.page.update()
                 return
             self.page.pop_dialog()
-            await self.show("tasks", notice="Task saved.")
+            await self.show(return_route, notice="Task saved.")
 
         dialog = ft.AlertDialog(
             modal=True,
@@ -851,7 +915,7 @@ class StudyWorkspace:
         title = ft.TextField(label="Subject title")
         color = ft.TextField(label="Color (hex)", value="#2196F3")
         description = ft.TextField(label="Description", multiline=True, min_lines=2)
-        error = ft.Text(color=ft.Colors.RED_700, visible=False)
+        error = ft.Text(color=self._error_text_color(), visible=False)
 
         async def save(_: Any) -> None:
             try:
@@ -944,10 +1008,12 @@ class StudyWorkspace:
                         width=40,
                         height=42,
                         bgcolor=(
-                            ft.Colors.BLUE_100
-                            if value == self.selected_day
-                            else None
-                        ),
+                            ft.Colors.BLUE_700
+                            if self.dark_mode
+                            else ft.Colors.BLUE_100
+                        )
+                        if value == self.selected_day
+                        else None,
                         border_radius=8,
                     )
                 )
@@ -1023,29 +1089,61 @@ class StudyWorkspace:
         )
         return ft.ListView(
             controls=[
-                ft.Text("Appearance", size=18, weight=ft.FontWeight.BOLD),
-                dark_mode,
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Text(
+                                "Appearance",
+                                size=18,
+                                weight=ft.FontWeight.BOLD,
+                            ),
+                            ft.Text(
+                                "Choose the color theme used throughout the app.",
+                                size=13,
+                                color=self._secondary_text_color(),
+                            ),
+                            dark_mode,
+                        ],
+                        spacing=6,
+                    ),
+                    padding=14,
+                    bgcolor=self._surface_color(),
+                    border_radius=12,
+                ),
                 ft.Divider(),
                 ft.Text("Notifications", size=18, weight=ft.FontWeight.BOLD),
                 ft.Container(
                     content=ft.Row(
                         controls=[
-                            ft.Icon(ft.Icons.NOTIFICATIONS),
+                            ft.Icon(
+                                ft.Icons.NOTIFICATIONS_OUTLINED,
+                                color=self._secondary_text_color(),
+                            ),
                             ft.Column(
                                 controls=[
-                                    ft.Text("Deadline reminders"),
+                                    ft.Text(
+                                        "Deadline reminders",
+                                        weight=ft.FontWeight.W_500,
+                                    ),
                                     ft.Text(
                                         "Notifications are not configured in this version.",
                                         size=12,
+                                        color=self._secondary_text_color(),
                                     ),
                                 ],
                                 spacing=3,
+                                expand=True,
+                            ),
+                            ft.Text(
+                                "Unavailable",
+                                size=12,
+                                color=self._secondary_text_color(),
                             ),
                         ]
                     ),
-                    padding=12,
-                    bgcolor=ft.Colors.GREY_100,
-                    border_radius=10,
+                    padding=14,
+                    bgcolor=self._surface_color(),
+                    border_radius=12,
                 ),
                 ft.Divider(),
                 ft.Text("Study assistance", size=18, weight=ft.FontWeight.BOLD),
@@ -1057,6 +1155,7 @@ class StudyWorkspace:
                                 "Task recommendations and the study chatbot are "
                                 "available on the Home dashboard.",
                                 size=12,
+                                color=self._secondary_text_color(),
                             ),
                             ft.TextButton(
                                 "Open Home",
@@ -1068,17 +1167,17 @@ class StudyWorkspace:
                         ],
                         spacing=3,
                     ),
-                    padding=12,
-                    bgcolor=ft.Colors.GREY_100,
-                    border_radius=10,
+                    padding=14,
+                    bgcolor=self._surface_color(),
+                    border_radius=12,
                 ),
-                ft.TextButton(
-                    "Profile and account",
+                ft.OutlinedButton(
+                    content="Profile and account",
                     icon=ft.Icons.PERSON,
                     on_click=lambda _: self.page.run_task(self.show, "profile"),
                 ),
             ],
-            spacing=12,
+            spacing=10,
             expand=True,
         )
 
@@ -1087,7 +1186,10 @@ class StudyWorkspace:
         self.page.theme_mode = (
             ft.ThemeMode.DARK if self.dark_mode else ft.ThemeMode.LIGHT
         )
-        self.page.update()
+        if self.auth.session is not None:
+            self._render(self.auth.session)
+        else:
+            self.page.update()
 
     def _profile_screen(self, session: AuthSession) -> ft.Control:
         async def logout(_: Any) -> None:

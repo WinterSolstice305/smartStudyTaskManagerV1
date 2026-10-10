@@ -1,70 +1,143 @@
-# smartStudyTaskManagerV1
+# Smart Study Task Manager
 
-## Gemini AI setup
+Smart Study Task Manager is a Python/Flet desktop application for managing academic subjects, tasks, deadlines, and study planning. The app authenticates users with Firebase Email/Password and stores user-scoped task and subject data in Cloud Firestore.
 
-Install the project dependencies from the project directory:
+## Current implementation status
+
+Implemented and covered by repository tests:
+
+- Firebase email/password authentication flow
+- Firestore REST API integration with user-scoped document paths
+- subject CRUD and task CRUD
+- task filtering, sorting, and calendar helpers
+- AI recommendations and study-planning chat using Gemini
+- Firebase security rules and rules-unit testing
+
+Partially implemented or unverified live workflow:
+
+- Android APK build path (`build/flutter`) is present but not validated by a checked-in build script
+- Gemini API calls are implemented and unit-tested with mocks, but live calls are not verified in this repo
+- the app relies on client-side Firebase configuration and environment variables rather than a custom backend
+
+## Technology stack
+
+- Python: `>=3.14` (`pyproject.toml`)
+- Flet: `1.0.3` in `requirements.txt`; `1.0.4` in `build/flutter/pubspec.yaml` (notable discrepancy)
+- Google GenAI: `google-genai>=1.0.0,<3.0.0`
+- Python dotenv: `python-dotenv>=1.0.0,<2.0.0`
+- Firebase Authentication + Firestore REST API
+- Gemini API for AI recommendations/chat
+- Firebase rules-unit testing for security validation
+
+## Prerequisites
+
+- Python 3.14+
+- A Firebase project with Email/Password auth enabled
+- A Firestore database for the project
+- A Gemini API key from Google AI Studio
+- Node.js for Firebase rules tests
+- Flutter/Android SDK only for APK packaging work
+
+## Quick start
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
+python main.py
 ```
 
-Create a Gemini Developer API key in Google AI Studio and set it in `.env`:
+Then populate your local `.env` file with real values, not placeholders:
 
 ```dotenv
-GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+FIREBASE_API_KEY=your-firebase-web-api-key
+FIREBASE_PROJECT_ID=your-firebase-project-id
+GEMINI_API_KEY=your-gemini-key
 GEMINI_MODEL=gemini-2.5-flash
 ```
 
-The model setting is optional and defaults to `gemini-2.5-flash`; set
-`GEMINI_MODEL` to another model enabled for your API project to change it.
-When copying `.env.example`, replace `YOUR_GEMINI_MODEL` with
-`gemini-2.5-flash` (or omit `GEMINI_MODEL` to use the default). Restart the app
-after changing `.env`. The API key is required for live AI requests. The
-automated tests use mocked Gemini responses and do not use quota.
+## Environment and configuration
 
-`app.services.gemini.generate_task_recommendations(tasks, subjects=None)`
-returns a summary and up to five validated recommendations for incomplete
-tasks. `app.services.gemini.chat_about_tasks(message, tasks, subjects=None)`
-returns a single-turn workload/planning answer. The service has no Firestore
-write access; it receives the current authenticated user's already-loaded
-task snapshot. Requests are asynchronous, bounded in size, and have a 25-second
-timeout.
+The application expects the following runtime values:
 
-Run the Python tests with:
+- `FIREBASE_API_KEY`
+- `FIREBASE_PROJECT_ID`
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL` (optional; defaults to `gemini-2.5-flash`)
+
+See `.env.example` for the sanitized template, and see [docs/SETUP.md](./docs/SETUP.md) for setup details.
+
+## Running the app
+
+```powershell
+python main.py
+```
+
+The app starts in login mode and transitions into the authenticated workspace after sign-in.
+
+## Running tests
+
+Verified Python test command:
 
 ```powershell
 python -m unittest discover -s tests
 ```
 
-### Manual AI smoke checklist
+Firebase rules test command:
 
-1. Set a valid key, sign in, and create tasks with varied deadlines, priorities,
-   subjects, and completion states. Request recommendations; check completed
-   tasks are excluded and overdue/near-deadline tasks are identified correctly.
-2. Complete all tasks and request recommendations. Check the empty-state
-   message appears without an API request.
-3. Ask the chatbot which task is due first and what to study next. Check it uses
-   the visible tasks and acknowledges missing deadlines or subject details.
-4. Remove the API key and restart. Request recommendations and send a chat
-   message; check a useful configuration error appears and normal task
-   create/edit/complete/delete still works.
-5. Restore the key, then test offline access and (if available) a rate-limited
-   API response. Check the error is readable and the retry action works.
-6. Sign in as User A and make an AI request; log out, sign in as User B, and
-   repeat. Check each request only includes that user's task snapshot. Confirm
-   AI actions do not change tasks in Firestore.
-7. While each request is loading, try to submit it again and navigate around.
-   Check a loading indicator is shown, duplicate submission is blocked, and the
-   rest of the UI/task management remains usable.
+```powershell
+npm test
+```
 
-These are manual steps, not completed live checks. Automated tests cover
-mocked valid SDK responses, incomplete/completed and empty tasks, context use,
-malformed output, missing configuration, network/rate-limit errors, account
-switching, AI read-only behavior, and duplicate-request responsiveness. A live
-Gemini API call and Android APK build have not been tested.
+## Android build
 
-The Gemini API key embedded in an Android APK can be extracted. This
-environment-variable setup is for local development and demos only; protect
-production Android requests behind a trusted authenticated backend or
-server-side proxy. No such backend is included in this project.
+The repository contains a Flutter/Flet packaging layout under `build/flutter`, but there is no checked-in, validated Android APK script that is proven end-to-end in this repo. The packaging path is present and indicates intent, but it is not a confirmed, fully verified build workflow.
+
+Best-effort guidance:
+
+```powershell
+cd build\flutter
+flutter pub get
+flutter build apk
+```
+
+Treat this as a development-stage command until the project’s Android workflow is locally validated.
+
+## Documentation index
+
+- [docs/README.md](./docs/README.md)
+- [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
+- [docs/PROJECT_STRUCTURE.md](./docs/PROJECT_STRUCTURE.md)
+- [docs/SETUP.md](./docs/SETUP.md)
+- [docs/DATA_MODEL.md](./docs/DATA_MODEL.md)
+- [docs/FIREBASE_AND_SECURITY.md](./docs/FIREBASE_AND_SECURITY.md)
+
+## Known limitations and caveats
+
+- The repo uses in-memory session state; re-launching the app clears the current Firebase client session.
+- The app stores data under `/users/{uid}/...`, so user isolation is enforced by Firestore rules, not by a separate backend.
+- The default Firebase and Gemini configuration values in source code are not safe to treat as production secrets.
+- The repository currently validates behavior with unit tests and Firebase rule tests, but the live Gemini API and Android APK build are not fully validated in a production-like environment.
+
+## Troubleshooting
+
+If login fails, confirm:
+
+- `FIREBASE_API_KEY` is set
+- Email/Password auth is enabled in Firebase
+- the Firebase project ID matches the one declared in `.env`
+
+If Firestore fails, confirm:
+
+- the database exists
+- the security rules were deployed
+- the current user is authenticated and has the correct UID-scoped path
+
+If Gemini requests fail, confirm:
+
+- `GEMINI_API_KEY` is set
+- the selected model name is valid
+- the environment was restarted after the key was added
+
+See the project documentation for full setup and architecture details.
