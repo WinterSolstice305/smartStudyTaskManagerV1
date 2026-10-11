@@ -1,8 +1,10 @@
 import json
+import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -14,10 +16,14 @@ from app.models.subject import Subject
 from app.models.task import Task
 
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "gemini-2.5-flash"
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+
+_DEFAULT_MODEL = "gemini-3.8-flash"
 _REQUEST_TIMEOUT_MS = 25_000
+_BACKEND_REGION = "us-central1"
+_BACKEND_FUNCTION = "generateGemini"
 _MAX_RECOMMENDATION_TASKS = 40
 _MAX_CHAT_TASKS = 30
 _MAX_RECOMMENDATIONS = 5
@@ -85,7 +91,10 @@ _CHAT_INSTRUCTIONS = (
 
 
 async def generate_task_recommendations(
-    tasks: Sequence[Task], subjects: Sequence[Subject] | None = None
+    tasks: Sequence[Task],
+    subjects: Sequence[Subject] | None = None,
+    *,
+    id_token: str | None = None,
 ) -> TaskRecommendationResult:
     """Recommend up to five incomplete tasks using verified local deadline facts."""
     now = datetime.now(timezone.utc)
@@ -115,6 +124,7 @@ async def generate_task_recommendations(
         system_instruction=_RECOMMENDATION_INSTRUCTIONS,
         response_schema=_RECOMMENDATION_SCHEMA,
         max_output_tokens=900,
+        id_token=id_token,
     )
     payload = _parse_json_object(response_text)
     summary = payload.get("summary")
@@ -169,6 +179,8 @@ async def chat_about_tasks(
     message: str,
     tasks: Sequence[Task],
     subjects: Sequence[Subject] | None = None,
+    *,
+    id_token: str | None = None,
 ) -> str:
     """Answer one study-planning question using only the supplied task snapshot."""
     question = message.strip()
@@ -201,6 +213,7 @@ async def chat_about_tasks(
         prompt,
         system_instruction=_CHAT_INSTRUCTIONS,
         max_output_tokens=700,
+        id_token=id_token,
     )
     if not response_text.strip():
         raise GeminiServiceError(
@@ -215,12 +228,31 @@ async def _generate_text(
     system_instruction: str,
     response_schema: dict[str, Any] | None = None,
     max_output_tokens: int,
+    id_token: str | None = None,
 ) -> str:
+    backend_setting = os.environ.get("GEMINI_BACKEND_URL", "").strip()
+    if backend_setting.casefold() != "direct":
+        if not id_token:
+            raise GeminiServiceError(
+                "Your sign-in has expired. Sign in again to use AI assistance."
+            )
+        backend_url = backend_setting or _default_backend_url()
+        return await _generate_via_backend(
+            backend_url,
+            id_token=id_token,
+            prompt=prompt,
+            system_instruction=system_instruction,
+            response_schema=response_schema,
+            max_output_tokens=max_output_tokens,
+        )
+
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
+        logger.warning("Gemini is not configured: GEMINI_API_KEY is unavailable.")
         raise GeminiServiceError(
-            "AI assistance is not configured. Add GEMINI_API_KEY to your local "
-            ".env file and restart the app."
+            "AI assistance is not configured. For local development, set "
+            "GEMINI_API_KEY in the repository .env file and restart the app. "
+            "Android builds require a trusted backend; do not package this key."
         )
     model = os.environ.get("GEMINI_MODEL", _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
 
@@ -243,31 +275,71 @@ async def _generate_text(
                 config=config,
             )
     except errors.APIError as error:
-        if error.code == 429:
+        status_code = error.code
+        if status_code == 429:
+            category = "quota_or_rate_limit"
+        elif status_code in (401, 403):
+            category = "authentication_or_access"
+        elif status_code == 404:
+            category = "model_not_found"
+        elif status_code == 400:
+            category = "invalid_request"
+        elif status_code in (408, 504):
+            category = "network_timeout"
+        elif isinstance(status_code, int) and status_code >= 500:
+            category = "upstream_server"
+        else:
+            category = "api_error"
+        logger.warning(
+            "Gemini API request failed: category=%s status=%s model=%s",
+            category,
+            status_code,
+            model,
+        )
+        if status_code == 429:
             raise GeminiServiceError(
-                "Gemini is rate-limited right now. Wait a moment and retry."
+                "Gemini quota or rate limit reached. Wait a moment, check your "
+                "Google AI quota, and retry."
             ) from None
-        if error.code == 404:
+        if status_code == 404:
             raise GeminiServiceError(
                 "The configured Gemini model is unavailable. Check GEMINI_MODEL."
             ) from None
-        if error.code in (401, 403):
+        if status_code in (401, 403):
             raise GeminiServiceError(
                 "Gemini rejected the API key. Check GEMINI_API_KEY and your API access."
             ) from None
-        if error.code == 400:
+        if status_code == 400:
             raise GeminiServiceError(
                 "Gemini could not process this request. Check the configured model "
                 "and try again."
             ) from None
+        if status_code in (408, 504):
+            raise GeminiServiceError(
+                "Gemini took too long to respond. Check your connection and retry."
+            ) from None
+        if isinstance(status_code, int) and status_code >= 500:
+            raise GeminiServiceError(
+                "Gemini is temporarily unavailable. Please try again later."
+            ) from None
         raise GeminiServiceError(
             "Gemini is temporarily unavailable. Please try again later."
         ) from None
-    except (httpx.TimeoutException, TimeoutError):
+    except (httpx.TimeoutException, TimeoutError) as error:
+        logger.warning(
+            "Gemini API request timed out: error_type=%s model=%s",
+            type(error).__name__,
+            model,
+        )
         raise GeminiServiceError(
             "Gemini took too long to respond. Check your connection and retry."
         ) from None
-    except (httpx.HTTPError, OSError):
+    except (httpx.HTTPError, OSError) as error:
+        logger.warning(
+            "Gemini API connection failed: error_type=%s model=%s",
+            type(error).__name__,
+            model,
+        )
         raise GeminiServiceError(
             "Could not reach Gemini. Check your internet connection and retry."
         ) from None
@@ -278,6 +350,129 @@ async def _generate_text(
             "Gemini returned an empty or invalid response. Please retry."
         )
     return text.strip()
+
+
+def _default_backend_url() -> str:
+    project_id = os.environ.get(
+        "FIREBASE_PROJECT_ID", "smartstudytaskmanagerv1"
+    ).strip()
+    return (
+        f"https://{_BACKEND_REGION}-{project_id}.cloudfunctions.net/"
+        f"{_BACKEND_FUNCTION}"
+    )
+
+
+async def _generate_via_backend(
+    backend_url: str,
+    *,
+    id_token: str,
+    prompt: str,
+    system_instruction: str,
+    response_schema: dict[str, Any] | None,
+    max_output_tokens: int,
+) -> str:
+    payload = {
+        "prompt": prompt,
+        "system_instruction": system_instruction,
+        "response_schema": response_schema,
+        "max_output_tokens": max_output_tokens,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_MS / 1000) as client:
+            response = await client.post(
+                backend_url,
+                json=payload,
+                headers={"Authorization": f"Bearer {id_token}"},
+            )
+    except (httpx.TimeoutException, TimeoutError) as error:
+        logger.warning(
+            "Gemini backend request timed out: error_type=%s",
+            type(error).__name__,
+        )
+        raise GeminiServiceError(
+            "The AI service took too long to respond. Check your connection and retry."
+        ) from None
+    except (httpx.HTTPError, OSError) as error:
+        logger.warning(
+            "Gemini backend connection failed: error_type=%s",
+            type(error).__name__,
+        )
+        raise GeminiServiceError(
+            "Could not reach the AI service. Check your internet connection and retry."
+        ) from None
+
+    if response.is_error:
+        error_code = ""
+        try:
+            error_body = response.json()
+            error_details = (
+                error_body.get("error") if isinstance(error_body, dict) else None
+            )
+            if isinstance(error_details, dict):
+                error_code = str(error_details.get("code", ""))
+        except (ValueError, TypeError):
+            pass
+        logger.warning(
+            "Gemini backend request failed: category=%s status=%s",
+            _backend_error_category(response.status_code, error_code),
+            response.status_code,
+        )
+        raise GeminiServiceError(
+            _backend_error_message(response.status_code, error_code)
+        ) from None
+
+    try:
+        response_body = response.json()
+    except (ValueError, TypeError):
+        raise GeminiServiceError(
+            "The AI service returned an invalid response. Please retry."
+        ) from None
+    text = response_body.get("text") if isinstance(response_body, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise GeminiServiceError(
+            "The AI service returned an empty or invalid response. Please retry."
+        )
+    return text.strip()
+
+
+def _backend_error_category(status_code: int, error_code: str) -> str:
+    if status_code == 401:
+        return "firebase_authentication"
+    if status_code in (408, 504) or error_code == "GEMINI_TIMEOUT":
+        return "network_timeout"
+    if error_code == "GEMINI_DAILY_LIMIT":
+        return "user_daily_limit"
+    if status_code == 429:
+        return "quota_or_rate_limit"
+    if error_code == "GEMINI_MODEL":
+        return "model_not_found"
+    if error_code == "GEMINI_AUTH":
+        return "authentication_or_access"
+    if status_code == 404:
+        return "backend_not_deployed"
+    if status_code >= 500:
+        return "backend_or_upstream_failure"
+    return "backend_request_error"
+
+
+def _backend_error_message(status_code: int, error_code: str) -> str:
+    if status_code == 401:
+        return "Your sign-in has expired. Sign in again to use AI assistance."
+    if status_code in (408, 504) or error_code == "GEMINI_TIMEOUT":
+        return "The AI service took too long to respond. Check your connection and retry."
+    if error_code == "GEMINI_DAILY_LIMIT":
+        return "You've reached today's AI request limit. Please try again tomorrow."
+    if status_code == 429:
+        return "Gemini quota or rate limit reached. Wait a moment and retry."
+    if error_code == "GEMINI_MODEL":
+        return "The configured Gemini model is unavailable. Check the backend model setting."
+    if error_code == "GEMINI_AUTH":
+        return "The AI service credentials were rejected. Please contact the administrator."
+    if status_code == 404:
+        return "The AI backend is not deployed or configured. Please contact the administrator."
+    if status_code >= 500:
+        return "Gemini is temporarily unavailable. Please try again later."
+    return "The AI service could not process this request. Please retry."
 
 
 def _task_context(

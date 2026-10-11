@@ -1,13 +1,18 @@
 import asyncio
 import json
+import logging
 import math
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 from app.services.firebase_auth import FirebaseAuthService
+
+
+logger = logging.getLogger(__name__)
 
 
 class FirestoreError(Exception):
@@ -40,7 +45,7 @@ class FirestoreService:
         document_id: str | None = None,
     ) -> str:
         collection_path = self._user_collection_path(collection)
-        query: dict[str, str] = {}
+        query: dict[str, str | int] = {}
         if document_id is not None:
             query["documentId"] = self._validate_document_id(document_id)
         response = await asyncio.to_thread(
@@ -50,6 +55,8 @@ class FirestoreService:
             {"fields": self._encode_fields(data)},
             query,
         )
+        if response is None:
+            raise FirestoreError("Firestore returned an empty document response.")
         name = response.get("name")
         if not isinstance(name, str) or not name.rsplit("/", 1)[-1]:
             raise FirestoreError("Firestore returned an incomplete document response.")
@@ -91,6 +98,7 @@ class FirestoreService:
     async def list_documents(
         self, collection: str
     ) -> list[FirestoreDocument]:
+        started_at = perf_counter()
         path = self._user_collection_path(collection)
         documents: list[FirestoreDocument] = []
         page_token: str | None = None
@@ -98,9 +106,19 @@ class FirestoreService:
             query: dict[str, str | int] = {"pageSize": 1000}
             if page_token:
                 query["pageToken"] = page_token
-            response = await asyncio.to_thread(
-                self._request, "GET", path, None, query
-            )
+            try:
+                response = await asyncio.to_thread(
+                    self._request, "GET", path, None, query
+                )
+            except FirestoreError:
+                logger.warning(
+                    "Firestore could not load collection %s after %.2f seconds.",
+                    collection,
+                    perf_counter() - started_at,
+                )
+                raise
+            if response is None:
+                raise FirestoreError("Firestore returned an empty document list.")
             raw_documents = response.get("documents", [])
             if not isinstance(raw_documents, list):
                 raise FirestoreError("Firestore returned an invalid document list.")
@@ -109,6 +127,12 @@ class FirestoreService:
             documents.extend(self._decode_document(doc) for doc in raw_documents)
             page_token = response.get("nextPageToken")
             if not isinstance(page_token, str) or not page_token:
+                logger.info(
+                    "Firestore loaded collection %s (%d documents) in %.2f seconds.",
+                    collection,
+                    len(documents),
+                    perf_counter() - started_at,
+                )
                 return documents
 
     def _user_collection_path(self, collection: str) -> str:

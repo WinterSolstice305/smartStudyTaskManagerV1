@@ -1,8 +1,12 @@
 from collections.abc import Callable
+import logging
 
 import flet as ft
 
 from app.services.firebase_auth import FirebaseAuthError, FirebaseAuthService
+
+
+logger = logging.getLogger(__name__)
 
 
 def show(
@@ -57,3 +61,4 @@ def show(
             expand=True,
         )
     )
+    logger.info("Login screen added to the Flet page.")

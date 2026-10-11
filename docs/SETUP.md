@@ -39,18 +39,14 @@ The repository includes a Python requirements file and a `pyproject.toml` metada
 python -m pip install -r requirements.txt
 ```
 
-The verified dependency versions are:
+The declared dependency versions are:
 
-- `flet==1.0.3`
-- `google-genai>=1.0.0,<3.0.0`
-- `python-dotenv>=1.0.0,<2.0.0`
+- `flet>=1.0.4`
+- `google-genai>=1.0.0,<3.0.0` in `requirements.txt`
+- `python-dotenv>=1.0.0,<2.0.0` in `requirements.txt`
 
-There is a version mismatch between the Python runtime manifest and the Flutter packaging file:
-
-- `requirements.txt` pins `flet==1.0.3`
-- `build/flutter/pubspec.yaml` pins `flet: 1.0.4`
-
-This inconsistency is real and should be treated as a known repository discrepancy rather than silently normalized.
+`pyproject.toml` currently has stricter minimums for Google GenAI (`>=2.29.0`)
+and python-dotenv (`>=1.2.4`).
 
 ## 4. Environment configuration
 
@@ -60,19 +56,30 @@ Create a local `.env` file based on `.env.example`:
 FIREBASE_API_KEY=replace-with-firebase-web-api-key
 FIREBASE_PROJECT_ID=your-firebase-project-id
 GEMINI_API_KEY=replace-with-gemini-api-key
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-3.8-flash
+GEMINI_BACKEND_URL=direct
 ```
 
-This is the configuration used by:
+`app/services/gemini.py` explicitly loads the repository-root `.env` file with
+`python-dotenv`; `.env.example` is a template and is not loaded automatically.
+Existing process environment variables take precedence over values in `.env`.
+The current Gemini client reads:
 
-- `app/config.py` for Firebase and project defaults
-- `app/services/gemini.py` for Gemini API requests
+- `GEMINI_BACKEND_URL` to select the Cloud Function URL, or `direct` for
+  local-only calls to Google
+- `GEMINI_API_KEY` only when `GEMINI_BACKEND_URL=direct`; deployed functions
+  read the key from Firebase Secret Manager
+- `GEMINI_MODEL` for model selection (the client sends this only in direct mode;
+  deployed functions configure it server-side)
 
 Important notes:
 
 - `FIREBASE_API_KEY` is a web API key for the Firebase project.
 - `FIREBASE_PROJECT_ID` is the Firebase project ID, not the project display name.
-- `GEMINI_MODEL` is optional because the code falls back to `gemini-2.5-flash`.
+- `GEMINI_MODEL` is optional because the code falls back to `gemini-3.8-flash`.
+- In local `.env`, use `GEMINI_BACKEND_URL=direct` for local-only requests. Leave
+  it unset in packaged clients to use
+  `https://us-central1-<project>.cloudfunctions.net/generateGemini`.
 - The application reads these values at runtime from environment variables and falls back to hardcoded defaults in `app/config.py`; those defaults are not a safe production configuration.
 
 ## 5. Firebase project configuration
@@ -133,14 +140,43 @@ This uses Firebase rules unit testing to validate the rules file in an emulator 
 
 ## 9. Gemini API configuration
 
-In Google AI Studio, create a Gemini API key. Then add it to the `.env` file and restart the app after the change.
+For local-only development, create a Gemini API key in Google AI Studio, set
+`GEMINI_BACKEND_URL=direct` and add the key to the root `.env` file. Never
+commit or distribute this key.
 
-The implementation in `app/services/gemini.py` expects these environment variables:
+The default model is `gemini-3.8-flash`, which is listed in Google's current
+[Gemini API model documentation](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash).
+Model availability, project quota, key restrictions, and network access still
+depend on the configured Google project. Sanitized application logs report the
+HTTP status category and model, but intentionally omit the API key and response
+body.
 
-- `GEMINI_API_KEY`
-- `GEMINI_MODEL` (optional)
+The app defaults to an authenticated Firebase Cloud Function; its URL is derived
+from `FIREBASE_PROJECT_ID` and can be overridden with `GEMINI_BACKEND_URL`.
+The function verifies Firebase ID tokens, applies a per-user daily request
+limit, and keeps `GEMINI_API_KEY` in Firebase Secret Manager. The Android client
+does not need the Gemini key. Do not set `GEMINI_BACKEND_URL=direct`, bundle a
+repository `.env`, or pass the Gemini key as an APK build variable.
 
-The default model is `gemini-2.5-flash`.
+To deploy the backend, use a Firebase project with Cloud Functions and Firestore
+enabled, install the function dependencies, set the secret, and deploy:
+
+```powershell
+Set-Location functions
+npm install
+Set-Location ..
+firebase functions:secrets:set GEMINI_API_KEY
+firebase deploy --only functions:generateGemini
+```
+
+The deployed function defaults to `gemini-3.8-flash`. To select another model,
+set `GEMINI_MODEL` in `functions/.env` before deploying; do not put the API key
+in that file.
+
+Cloud Functions deployment requires an eligible Firebase/Google Cloud billing
+plan. The project's function service account must be able to access Firestore
+for the daily usage counter. No live deployment or Android APK has been
+validated from this repository.
 
 ## 10. Desktop development startup
 
@@ -197,14 +233,21 @@ The Firestore security rules test is:
 npm test
 ```
 
+The Cloud Function request and Gemini error-classification tests are:
+
+```powershell
+npm.cmd --prefix functions test
+```
+
 These are the commands that are actually supported by the checked-in code and tooling.
 
 ## 14. Known setup risks
 
 - The project is configured around a client-only Firebase web API usage model; this is fine for demos and local development but not a production-safe backend boundary.
 - The default Firebase API key in `app/config.py` and the default project ID are not production values.
-- The repo currently contains a known version mismatch between the Python dependency and the Flutter packaging config.
 - The Gemini key should never be embedded in Android builds or any other shipped artifact.
+- Direct Google API requests are intended only for local development; Android
+  clients must use the authenticated Cloud Function.
 
 ## 15. Troubleshooting
 
@@ -222,9 +265,16 @@ These are the commands that are actually supported by the checked-in code and to
 
 ### Gemini requests fail
 
-- confirm `GEMINI_API_KEY` is set
-- verify the model name is available in your project
-- check the app logs for `GeminiServiceError` messages
+- for local direct mode, set `GEMINI_BACKEND_URL=direct` and confirm `.env`
+  contains `GEMINI_API_KEY` (the app loads `.env`, not `.env.example`)
+- otherwise, verify the Firebase Cloud Function is deployed and the app's
+  Firebase project ID matches its project
+- verify the configured backend `GEMINI_MODEL` exists and is enabled
+- use the sanitized application log category/status to distinguish missing
+  configuration, key access, model, quota/rate-limit, timeout/network, and
+  upstream server failures
+- do not copy the development key to the device or APK; the Cloud Function reads
+  the deployed secret and reports sanitized failure categories in its logs
 
 ### Android build fails
 

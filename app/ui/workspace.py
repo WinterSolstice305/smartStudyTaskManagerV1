@@ -1,4 +1,7 @@
-from calendar import month_name
+import asyncio
+import logging
+import time as time_module
+from calendar import month_name, monthrange
 from datetime import date, datetime, time, timezone
 from typing import Any
 
@@ -20,8 +23,18 @@ from app.services.gemini import (
     generate_task_recommendations,
 )
 from app.services.subject_service import SubjectService
+from app.services.study_cache import StudyCache
 from app.services.task_service import TaskService
 from app.ui.task_views import filter_tasks, month_grid, sort_tasks, tasks_for_date
+from app.ui.theme import (
+    apply_theme,
+    colors_for,
+    load_dark_mode,
+    save_dark_mode,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class StudyWorkspace:
@@ -48,6 +61,7 @@ class StudyWorkspace:
         self.firestore = FirestoreService(auth, project_id)
         self.subjects = SubjectService(self.firestore)
         self.tasks = TaskService(self.firestore, self.subjects)
+        self._study_cache = StudyCache()
         self.on_unauthenticated = on_unauthenticated
         self.route = "home"
         self.task_cache: list[Task] = []
@@ -58,6 +72,8 @@ class StudyWorkspace:
         self._data_uid: str | None = None
         self._data_loading = False
         self._data_available = False
+        self._data_error = ""
+        self._startup_state = "initializing"
         self._recommendation_loading = False
         self._recommendation_request_id = 0
         self._recommendation_result: TaskRecommendationResult | None = None
@@ -67,10 +83,29 @@ class StudyWorkspace:
         self._chat_message = ""
         self._chat_response = ""
         self._chat_error = ""
+        self.dark_mode = load_dark_mode()
+        self._load_request_id = 0
+        self._loading_status: ft.Text | None = None
+        self._filters_expanded = False
+        self._task_filter_values = {
+            "subject_id": "",
+            "status": "",
+            "priority": "",
+            "category": "",
+            "ordering": "deadline_asc",
+        }
+        apply_theme(page, self.dark_mode)
 
-    async def show(self, route: str | None = None, notice: str = "") -> None:
+    async def show(
+        self,
+        route: str | None = None,
+        notice: str = "",
+        *,
+        refresh: bool = False,
+    ) -> None:
         if self.auth.session is None:
-            self._invalidate_ai_requests()
+            self._load_request_id += 1
+            self._data_loading = False
             self._clear_account_data()
             self.on_unauthenticated()
             return
@@ -78,40 +113,161 @@ class StudyWorkspace:
             self.route = route
         session = self.auth.session
         if session is None:
-            self._invalidate_ai_requests()
+            self._data_loading = False
             self._clear_account_data()
             self.on_unauthenticated()
             return
+        account_changed = self._data_uid != session.uid
+        if (
+            self._startup_state != "initializing"
+            and not account_changed
+            and not refresh
+        ):
+            self._render(session, notice=notice, error=self._data_error)
+            return
+
+        self._load_request_id += 1
+        load_request_id = self._load_request_id
         self._invalidate_ai_requests()
         self._data_loading = True
-        self._data_available = False
-        self._clear_ai_state()
-        if self._data_uid != session.uid:
+        initial_startup = self._startup_state == "initializing"
+        if account_changed:
             self._clear_account_data()
             self._data_uid = session.uid
+        cached_data = self._study_cache.load(session.uid) if initial_startup else None
+        if cached_data is not None:
+            self.task_cache, self.subject_cache = cached_data
+            self._data_available = True
+            self._render(
+                session,
+                notice="Showing saved tasks while checking for updates...",
+            )
+        if initial_startup:
+            if cached_data is None:
+                self._render_loading()
+            slow_status = asyncio.create_task(
+                self._show_slow_load_status(session.uid, load_request_id)
+            )
+        else:
+            slow_status = None
+            self._render(session, notice=notice, error=self._data_error)
         error_message = ""
+        started_at = time_module.perf_counter()
+        logger.info(
+            "%s study data for the authenticated workspace.",
+            "Initializing" if initial_startup else "Refreshing",
+        )
         try:
             self.task_cache, self.subject_cache = await self._load_data(session)
+            if load_request_id != self._load_request_id:
+                return
             self._data_available = True
+            self._data_error = ""
+            self._startup_state = "ready"
+            self._study_cache.save(session.uid, self.task_cache, self.subject_cache)
+            logger.info(
+                "Study data %s in %.2f seconds (%d tasks, %d subjects).",
+                "initialized" if initial_startup else "refreshed",
+                time_module.perf_counter() - started_at,
+                len(self.task_cache),
+                len(self.subject_cache),
+            )
         except AuthenticationRequiredError:
+            if load_request_id != self._load_request_id:
+                return
             self.task_cache = []
             self.subject_cache = []
             self._data_uid = None
             self._data_loading = False
             self._data_available = False
+            self._startup_state = "ready"
             self._clear_ai_state()
             self.on_unauthenticated()
             return
         except FirestoreError as error:
+            if load_request_id != self._load_request_id:
+                return
+            logger.warning(
+                "Study data loading failed after %.2f seconds: %s",
+                time_module.perf_counter() - started_at,
+                error,
+            )
             error_message = str(error)
-            self.task_cache = []
-            self.subject_cache = []
+            if account_changed:
+                self.task_cache = []
+                self.subject_cache = []
         except (ModelValidationError, ValueError) as error:
+            if load_request_id != self._load_request_id:
+                return
+            logger.exception("Saved study data could not be validated.")
             error_message = f"Could not read saved study data: {error}"
-            self.task_cache = []
-            self.subject_cache = []
-        self._data_loading = False
-        self._render(session, notice=notice, error=error_message)
+            if account_changed:
+                self.task_cache = []
+                self.subject_cache = []
+        finally:
+            if slow_status is not None:
+                slow_status.cancel()
+        if load_request_id == self._load_request_id:
+            self._data_loading = False
+            if error_message:
+                self._data_error = error_message
+                if initial_startup:
+                    self._startup_state = "error"
+            self._render(session, notice=notice, error=self._data_error)
+
+    async def _retry_data_load(self) -> None:
+        await self.show(self.route, refresh=True)
+
+    async def _show_slow_load_status(self, uid: str, request_id: int) -> None:
+        await asyncio.sleep(5)
+        if (
+            self._data_loading
+            and self._load_request_id == request_id
+            and self.auth.session is not None
+            and self.auth.session.uid == uid
+            and self._loading_status is not None
+        ):
+            self._loading_status.value = (
+                "Still connecting. This can take a moment on a slow network."
+            )
+            self.page.update()
+
+    def _render_loading(self) -> None:
+        palette = colors_for(self.dark_mode)
+        self._loading_status = ft.Text(
+            "Loading your tasks and subjects...",
+            color=palette.secondary_text,
+            text_align=ft.TextAlign.CENTER,
+        )
+        self.page.clean()
+        self.page.add(
+            ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Icon(
+                            ft.Icons.AUTO_STORIES,
+                            size=42,
+                            color=palette.primary,
+                        ),
+                        ft.Text(
+                            "Smart Study Task Manager",
+                            size=22,
+                            weight=ft.FontWeight.BOLD,
+                            color=palette.text,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        ft.ProgressRing(color=palette.primary),
+                        self._loading_status,
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=18,
+                ),
+                alignment=ft.Alignment.CENTER,
+                bgcolor=palette.background,
+                expand=True,
+            )
+        )
 
     async def _load_data(self, session: AuthSession) -> tuple[list[Task], list[Subject]]:
         if self.auth.session is None or self.auth.session.uid != session.uid:
@@ -160,29 +316,35 @@ class StudyWorkspace:
             status_controls.append(
                 ft.Text(notice, color=self._success_text_color(), selectable=True)
             )
-        if error:
+        current_error = error or self._data_error
+        if self._data_loading:
             status_controls.append(
-                ft.Text(error, color=self._error_text_color(), selectable=True)
-            )
-        home_action = (
-            ft.Container(
-                content=ft.Row(
+                ft.Row(
                     controls=[
-                        ft.FloatingActionButton(
-                            icon=ft.Icons.ADD,
-                            tooltip="Add Task",
-                            bgcolor=ft.Colors.BLUE_700,
-                            foreground_color=ft.Colors.WHITE,
-                            on_click=lambda _: self._show_task_dialog(),
-                        )
+                        ft.ProgressRing(width=16, height=16, stroke_width=2),
+                        ft.Text(
+                            "Refreshing your study data...",
+                            color=self._secondary_text_color(),
+                        ),
                     ],
-                    alignment=ft.MainAxisAlignment.END,
-                ),
-                padding=ft.Padding(0, 0, 16, 8),
+                    spacing=8,
+                )
             )
-            if self.route == "home"
-            else None
-        )
+        if current_error:
+            status_controls.append(
+                ft.Text(
+                    current_error,
+                    color=self._error_text_color(),
+                    selectable=True,
+                )
+            )
+            status_controls.append(
+                ft.TextButton(
+                    "Retry",
+                    icon=ft.Icons.REFRESH,
+                    on_click=lambda _: self.page.run_task(self._retry_data_load),
+                )
+            )
         self.page.clean()
         self.page.add(
             ft.Column(
@@ -190,7 +352,6 @@ class StudyWorkspace:
                     ft.Container(header, padding=ft.Padding(16, 12, 8, 8)),
                     *status_controls,
                     ft.Container(content=body, expand=True, padding=ft.Padding(16, 4, 16, 12)),
-                    *([home_action] if home_action is not None else []),
                     self._navigation_bar(),
                 ],
                 spacing=0,
@@ -199,22 +360,22 @@ class StudyWorkspace:
         )
 
     def _surface_color(self) -> str:
-        return ft.Colors.GREY_900 if self.dark_mode else ft.Colors.GREY_100
+        return colors_for(self.dark_mode).surface
 
     def _raised_surface_color(self) -> str:
-        return ft.Colors.GREY_800 if self.dark_mode else ft.Colors.WHITE
+        return colors_for(self.dark_mode).elevated_surface
 
     def _accent_surface_color(self) -> str:
-        return ft.Colors.BLUE_900 if self.dark_mode else ft.Colors.BLUE_50
+        return colors_for(self.dark_mode).accent_surface
 
     def _secondary_text_color(self) -> str:
-        return ft.Colors.GREY_400 if self.dark_mode else ft.Colors.GREY_700
+        return colors_for(self.dark_mode).secondary_text
 
     def _error_text_color(self) -> str:
-        return ft.Colors.RED_300 if self.dark_mode else ft.Colors.RED_700
+        return colors_for(self.dark_mode).error
 
     def _success_text_color(self) -> str:
-        return ft.Colors.GREEN_300 if self.dark_mode else ft.Colors.GREEN_700
+        return colors_for(self.dark_mode).accent
 
     def _navigation_bar(self) -> ft.NavigationBar:
         selected_index = (
@@ -445,7 +606,9 @@ class StudyWorkspace:
         self._recommendation_error = ""
         self._render(session)
         try:
-            result = await generate_task_recommendations(tasks, subjects)
+            result = await generate_task_recommendations(
+                tasks, subjects, id_token=session.id_token
+            )
         except GeminiServiceError as error:
             if self._recommendation_request_is_current(session.uid, request_id):
                 self._recommendation_error = str(error)
@@ -476,7 +639,9 @@ class StudyWorkspace:
         self._chat_error = ""
         self._render(session)
         try:
-            response = await chat_about_tasks(message, tasks, subjects)
+            response = await chat_about_tasks(
+                message, tasks, subjects, id_token=session.id_token
+            )
         except GeminiServiceError as error:
             if self._chat_request_is_current(session.uid, request_id):
                 self._chat_error = str(error)
@@ -518,6 +683,7 @@ class StudyWorkspace:
         self.subject_cache = []
         self._data_uid = None
         self._data_available = False
+        self._data_error = ""
         self._clear_ai_state()
 
     def _clear_ai_state(self) -> None:
@@ -541,9 +707,10 @@ class StudyWorkspace:
         )
 
     def _task_screen(self) -> ft.Control:
+        subject_folders = self._subject_folder_strip()
         subject_filter = ft.Dropdown(
             label="Subject",
-            value="",
+            value=self._task_filter_values["subject_id"],
             options=[
                 ft.DropdownOption(key="", text="All subjects"),
                 *[
@@ -551,12 +718,14 @@ class StudyWorkspace:
                     for subject in self.subject_cache
                 ],
             ],
-            on_select=lambda _: self._apply_task_filters(),
+            on_select=lambda event: self._set_task_filter(
+                "subject_id", event.control.value or ""
+            ),
             expand=True,
         )
         status_filter = ft.Dropdown(
             label="Status",
-            value="",
+            value=self._task_filter_values["status"],
             options=[
                 ft.DropdownOption(key="", text="All statuses"),
                 *[
@@ -564,12 +733,14 @@ class StudyWorkspace:
                     for status in self._STATUSES
                 ],
             ],
-            on_select=lambda _: self._apply_task_filters(),
+            on_select=lambda event: self._set_task_filter(
+                "status", event.control.value or ""
+            ),
             expand=True,
         )
         priority_filter = ft.Dropdown(
             label="Priority",
-            value="",
+            value=self._task_filter_values["priority"],
             options=[
                 ft.DropdownOption(key="", text="All priorities"),
                 *[
@@ -577,13 +748,15 @@ class StudyWorkspace:
                     for value in self._PRIORITIES
                 ],
             ],
-            on_select=lambda _: self._apply_task_filters(),
+            on_select=lambda event: self._set_task_filter(
+                "priority", event.control.value or ""
+            ),
             expand=True,
         )
         category_values = sorted({task.category for task in self.task_cache})
         category_filter = ft.Dropdown(
             label="Category",
-            value="",
+            value=self._task_filter_values["category"],
             options=[
                 ft.DropdownOption(key="", text="All categories"),
                 *[
@@ -591,17 +764,21 @@ class StudyWorkspace:
                     for value in category_values
                 ],
             ],
-            on_select=lambda _: self._apply_task_filters(),
+            on_select=lambda event: self._set_task_filter(
+                "category", event.control.value or ""
+            ),
             expand=True,
         )
         sort_control = ft.Dropdown(
             label="Sort by",
-            value="deadline_asc",
+            value=self._task_filter_values["ordering"],
             options=[
                 ft.DropdownOption(key=value, text=label)
                 for label, value in self._SORTS.items()
             ],
-            on_select=lambda _: self._apply_task_filters(),
+            on_select=lambda event: self._set_task_filter(
+                "ordering", event.control.value or "deadline_asc"
+            ),
             expand=True,
         )
         task_list = ft.Column(spacing=8)
@@ -610,12 +787,14 @@ class StudyWorkspace:
         def update_list(update_page: bool = True) -> None:
             selected = filter_tasks(
                 self.task_cache,
-                subject_id=subject_filter.value or "",
-                status=status_filter.value or "",
-                priority=priority_filter.value or "",
-                category=category_filter.value or "",
+                subject_id=self._task_filter_values["subject_id"],
+                status=self._task_filter_values["status"],
+                priority=self._task_filter_values["priority"],
+                category=self._task_filter_values["category"],
             )
-            selected = sort_tasks(selected, sort_control.value or "deadline_asc")
+            selected = sort_tasks(
+                selected, self._task_filter_values["ordering"] or "deadline_asc"
+            )
             task_list.controls.clear()
             if selected:
                 task_list.controls.extend(self._task_tile(task) for task in selected)
@@ -634,6 +813,22 @@ class StudyWorkspace:
         self._active_task_list = task_list
         self._active_update_tasks = update_list
         update_list(update_page=False)
+        has_active_filters = any(
+            self._task_filter_values[key]
+            for key in ("subject_id", "status", "priority", "category")
+        ) or self._task_filter_values["ordering"] != "deadline_asc"
+
+        filter_button = ft.IconButton(
+            icon=ft.Icons.FILTER_ALT,
+            selected=self._filters_expanded or has_active_filters,
+            icon_color=(
+                colors_for(self.dark_mode).primary
+                if self._filters_expanded or has_active_filters
+                else self._secondary_text_color()
+            ),
+            tooltip="Filter and sort tasks",
+        )
+        self._active_filter_button = filter_button
         filter_section = ft.Container(
             content=ft.Column(
                 controls=[
@@ -644,6 +839,11 @@ class StudyWorkspace:
                                 size=17,
                                 weight=ft.FontWeight.BOLD,
                                 expand=True,
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.CLOSE,
+                                tooltip="Close filters",
+                                on_click=lambda _=None: self._toggle_task_filters(False),
                             ),
                             ft.TextButton(
                                 "Reset",
@@ -670,6 +870,11 @@ class StudyWorkspace:
             padding=12,
             bgcolor=self._surface_color(),
             border_radius=12,
+            visible=self._filters_expanded,
+        )
+        self._active_filter_panel = filter_section
+        filter_button.on_click = lambda _=None: self._toggle_task_filters(
+            not self._filters_expanded
         )
         return ft.ListView(
             controls=[
@@ -688,6 +893,19 @@ class StudyWorkspace:
                         ),
                     ]
                 ),
+                subject_folders,
+                ft.Row(
+                    controls=[
+                        ft.Text(
+                            "Your tasks",
+                            size=18,
+                            weight=ft.FontWeight.BOLD,
+                            expand=True,
+                        ),
+                        filter_button,
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
                 filter_section,
                 task_list,
             ],
@@ -699,11 +917,133 @@ class StudyWorkspace:
         update = getattr(self, "_active_update_tasks", None)
         if update:
             update()
+        self._refresh_subject_folder_strip()
+        self._refresh_filter_button()
+
+    def _subject_folder_strip(self) -> ft.Control:
+        """Build the tappable subject folders shown above the task list."""
+        folders: dict[str, ft.Button] = {}
+
+        def folder_button(subject: Subject | None) -> ft.Button:
+            subject_id = subject.id if subject else ""
+            task_count = sum(
+                task.subject_id == subject_id
+                for task in self.task_cache
+            ) if subject else len(self.task_cache)
+            selected = self._task_filter_values["subject_id"] == subject_id
+            title = subject.title if subject else "All tasks"
+            button = ft.Button(
+                content=f"{title} ({task_count})",
+                icon=ft.Icons.FOLDER_OPEN if selected else ft.Icons.FOLDER,
+                color=(
+                    colors_for(self.dark_mode).primary
+                    if selected
+                    else self._secondary_text_color()
+                ),
+                icon_color=(
+                    colors_for(self.dark_mode).primary
+                    if selected
+                    else self._secondary_text_color()
+                ),
+                bgcolor=(
+                    self._accent_surface_color()
+                    if selected
+                    else self._raised_surface_color()
+                ),
+                tooltip=f"Show tasks for {title}",
+                on_click=lambda _=None, value=subject_id: self._set_task_filter(
+                    "subject_id", value
+                ),
+            )
+            folders[subject_id] = button
+            return button
+
+        strip = ft.Container(
+            content=ft.Row(
+                controls=[
+                    folder_button(None),
+                    *(folder_button(subject) for subject in self.subject_cache),
+                ],
+                scroll=ft.ScrollMode.AUTO,
+                spacing=8,
+            ),
+            padding=ft.Padding(0, 2, 0, 4),
+        )
+        self._active_subject_folder_buttons = folders
+        return strip
+
+    def _refresh_subject_folder_strip(self) -> None:
+        for subject_id, button in getattr(
+            self, "_active_subject_folder_buttons", {}
+        ).items():
+            selected = self._task_filter_values["subject_id"] == subject_id
+            button.icon = ft.Icons.FOLDER_OPEN if selected else ft.Icons.FOLDER
+            button.color = (
+                colors_for(self.dark_mode).primary
+                if selected
+                else self._secondary_text_color()
+            )
+            button.icon_color = button.color
+            button.bgcolor = (
+                self._accent_surface_color()
+                if selected
+                else self._raised_surface_color()
+            )
+
+    def _refresh_filter_button(self) -> None:
+        button = getattr(self, "_active_filter_button", None)
+        if button is None:
+            return
+        has_active_filters = any(
+            self._task_filter_values[key]
+            for key in ("subject_id", "status", "priority", "category")
+        ) or self._task_filter_values["ordering"] != "deadline_asc"
+        button.selected = self._filters_expanded or has_active_filters
+        button.icon_color = (
+            colors_for(self.dark_mode).primary
+            if button.selected
+            else self._secondary_text_color()
+        )
+        self.page.update()
+
+    def _set_task_filter(self, key: str, value: str) -> None:
+        self._task_filter_values[key] = value
+        labels = {
+            "subject_id": "Subject",
+            "status": "Status",
+            "priority": "Priority",
+            "category": "Category",
+            "ordering": "Sort by",
+        }
+        for control in getattr(self, "_active_filter_controls", []):
+            if control.label == labels[key]:
+                control.value = value
+        self._apply_task_filters()
+
+    def _toggle_task_filters(self, expanded: bool) -> None:
+        self._filters_expanded = expanded
+        panel = getattr(self, "_active_filter_panel", None)
+        if panel is not None:
+            panel.visible = expanded
+        self._refresh_filter_button()
 
     def _reset_filters(self) -> None:
-        controls = getattr(self, "_active_filter_controls", [])
-        for control in controls:
-            control.value = "deadline_asc" if control.label == "Sort by" else ""
+        self._task_filter_values.update(
+            subject_id="",
+            status="",
+            priority="",
+            category="",
+            ordering="deadline_asc",
+        )
+        for control in getattr(self, "_active_filter_controls", []):
+            control.value = self._task_filter_values[
+                "ordering" if control.label == "Sort by" else {
+                    "Subject": "subject_id",
+                    "Status": "status",
+                    "Priority": "priority",
+                    "Category": "category",
+                }[control.label]
+            ]
         self._apply_task_filters()
 
     def _task_tile(self, task: Task, compact: bool = False) -> ft.Control:
@@ -785,7 +1125,7 @@ class StudyWorkspace:
         except (FirestoreError, DocumentNotFoundError, ModelValidationError, ValueError) as error:
             await self.show(self.route, notice=f"Could not update task: {error}")
             return
-        await self.show(self.route, notice="Task status updated.")
+        await self.show(self.route, notice="Task status updated.", refresh=True)
 
     def _show_task_dialog(self, task: Task | None = None) -> None:
         return_route = self.route
@@ -797,13 +1137,55 @@ class StudyWorkspace:
             min_lines=2,
             max_lines=4,
         )
+        selected_deadline: date | None = (
+            task.deadline.astimezone().date() if task and task.deadline else None
+        )
         deadline = ft.TextField(
-            label="Deadline (YYYY-MM-DD; optional)",
+            label="Deadline (optional)",
             value=(
-                task.deadline.astimezone().date().isoformat()
-                if task and task.deadline
+                selected_deadline.strftime("%b %d, %Y")
+                if selected_deadline
                 else ""
             ),
+            read_only=True,
+            on_click=lambda _=None: self.page.show_dialog(deadline_picker),
+            expand=True,
+        )
+
+        def update_deadline(event: Any) -> None:
+            nonlocal selected_deadline
+            picked = event.control.value
+            if isinstance(picked, datetime):
+                picked = picked.date()
+            if isinstance(picked, date):
+                selected_deadline = picked
+                deadline.value = picked.strftime("%b %d, %Y")
+                clear_deadline_button.visible = True
+                self.page.update()
+
+        deadline_picker = ft.DatePicker(
+            value=selected_deadline,
+            modal=True,
+            first_date=date(1900, 1, 1),
+            last_date=date(2200, 12, 31),
+            help_text="Select task deadline",
+            confirm_text="Select",
+            cancel_text="Cancel",
+            on_change=update_deadline,
+        )
+
+        def clear_deadline(_: Any = None) -> None:
+            nonlocal selected_deadline
+            selected_deadline = None
+            deadline.value = ""
+            clear_deadline_button.visible = False
+            self.page.update()
+
+        clear_deadline_button = ft.IconButton(
+            icon=ft.Icons.CLOSE,
+            tooltip="Clear deadline",
+            visible=selected_deadline is not None,
+            on_click=clear_deadline,
         )
         subject = ft.Dropdown(
             label="Subject (optional)",
@@ -846,7 +1228,7 @@ class StudyWorkspace:
                 self.page.update()
                 return
             try:
-                due = self._parse_deadline(deadline.value or "")
+                due = self._deadline_for_date(selected_deadline)
                 changes = {
                     "title": title.value.strip(),
                     "description": description.value or "",
@@ -872,7 +1254,7 @@ class StudyWorkspace:
                 self.page.update()
                 return
             self.page.pop_dialog()
-            await self.show(return_route, notice="Task saved.")
+            await self.show(return_route, notice="Task saved.", refresh=True)
 
         dialog = ft.AlertDialog(
             modal=True,
@@ -881,7 +1263,20 @@ class StudyWorkspace:
                 controls=[
                     title,
                     description,
-                    deadline,
+                    ft.Row(
+                        controls=[
+                            deadline,
+                            ft.IconButton(
+                                icon=ft.Icons.CALENDAR_MONTH,
+                                tooltip="Choose deadline",
+                                on_click=lambda _=None: self.page.show_dialog(
+                                    deadline_picker
+                                ),
+                            ),
+                            clear_deadline_button,
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
                     subject,
                     priority,
                     category,
@@ -897,19 +1292,16 @@ class StudyWorkspace:
                 ft.Button(content="Save", on_click=save),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
+            scrollable=True,
+            inset_padding=10,
         )
         self.page.show_dialog(dialog)
 
     @staticmethod
-    def _parse_deadline(value: str) -> datetime | None:
-        value = value.strip()
-        if not value:
+    def _deadline_for_date(selected_day: date | None) -> datetime | None:
+        if selected_day is None:
             return None
-        try:
-            parsed = date.fromisoformat(value)
-        except ValueError as error:
-            raise ValueError("Enter a valid deadline in YYYY-MM-DD format.") from error
-        return datetime.combine(parsed, time(23, 59)).astimezone()
+        return datetime.combine(selected_day, time(23, 59)).astimezone()
 
     def _show_subject_dialog(self) -> None:
         title = ft.TextField(label="Subject title")
@@ -930,7 +1322,7 @@ class StudyWorkspace:
                 self.page.update()
                 return
             self.page.pop_dialog()
-            await self.show("tasks", notice="Subject created.")
+            await self.show("tasks", notice="Subject created.", refresh=True)
 
         self.page.show_dialog(
             ft.AlertDialog(
@@ -956,7 +1348,7 @@ class StudyWorkspace:
                 await self.show("tasks", notice=f"Could not delete task: {error}")
                 return
             self.page.pop_dialog()
-            await self.show("tasks", notice="Task deleted.")
+            await self.show("tasks", notice="Task deleted.", refresh=True)
 
         self.page.show_dialog(
             ft.AlertDialog(
@@ -972,6 +1364,8 @@ class StudyWorkspace:
         )
 
     def _calendar_screen(self) -> ft.Control:
+        palette = colors_for(self.dark_mode)
+        today = date.today()
         dates_with_tasks = {
             task.deadline.astimezone().date()
             for task in self.task_cache
@@ -982,45 +1376,83 @@ class StudyWorkspace:
         weeks.append(
             ft.Row(
                 controls=[
-                    ft.Container(ft.Text(day, weight=ft.FontWeight.BOLD), width=40)
-                    for day in ["S", "M", "T", "W", "T", "F", "S"]
+                    ft.Container(
+                        content=ft.Text(
+                            day,
+                            weight=ft.FontWeight.BOLD,
+                            color=palette.secondary_text,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        alignment=ft.Alignment.CENTER,
+                        expand=True,
+                    )
+                    for day in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
                 ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                spacing=0,
+                expand=True,
             )
         )
         for start in range(0, len(cells), 7):
             day_cells: list[ft.Control] = []
             for value in cells[start : start + 7]:
                 if value is None:
-                    day_cells.append(ft.Container(width=40, height=42))
+                    day_cells.append(ft.Container(expand=True, height=52))
                     continue
-                label = str(value.day)
-                if value in dates_with_tasks:
-                    label = f"{label} •"
                 day_cells.append(
                     ft.Container(
-                        content=ft.TextButton(
-                            label,
-                            on_click=lambda _, selected=value: self._select_calendar_day(
-                                selected
-                            ),
+                        content=ft.Column(
+                            controls=[
+                                ft.Text(
+                                    str(value.day),
+                                    color=(
+                                        palette.on_primary
+                                        if value == self.selected_day
+                                        else palette.text
+                                    ),
+                                    text_align=ft.TextAlign.CENTER,
+                                ),
+                                ft.Row(
+                                    controls=[
+                                        ft.Container(
+                                            width=5,
+                                            height=5,
+                                            bgcolor=palette.accent,
+                                            border_radius=5,
+                                        )
+                                        if value in dates_with_tasks
+                                        else ft.Container(width=5, height=5)
+                                    ],
+                                    alignment=ft.MainAxisAlignment.CENTER,
+                                ),
+                            ],
+                            spacing=2,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                            alignment=ft.MainAxisAlignment.CENTER,
                         ),
-                        width=40,
-                        height=42,
+                        alignment=ft.Alignment.CENTER,
+                        expand=True,
+                        height=52,
                         bgcolor=(
-                            ft.Colors.BLUE_700
-                            if self.dark_mode
-                            else ft.Colors.BLUE_100
-                        )
-                        if value == self.selected_day
-                        else None,
-                        border_radius=8,
+                            palette.primary
+                            if value == self.selected_day
+                            else None
+                        ),
+                        border=(
+                            ft.Border.all(1, palette.accent)
+                            if value == today
+                            else None
+                        ),
+                        border_radius=10,
+                        on_click=lambda _, selected=value: self._select_calendar_day(
+                            selected
+                        ),
                     )
                 )
             weeks.append(
                 ft.Row(
                     controls=day_cells,
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    spacing=0,
+                    expand=True,
                 )
             )
         day_tasks = tasks_for_date(self.task_cache, self.selected_day)
@@ -1046,10 +1478,15 @@ class StudyWorkspace:
                             tooltip="Next month",
                             on_click=lambda _: self._change_month(1),
                         ),
-                    ]
+                        ft.TextButton(
+                            "Today",
+                            on_click=lambda _: self._go_to_today(),
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-                *weeks,
-                ft.Divider(),
+                ft.Column(controls=weeks, spacing=2, expand=True),
+                ft.Divider(color=palette.border),
                 ft.Text(
                     f"Tasks for {self.selected_day.strftime('%B %d, %Y')}",
                     size=18,
@@ -1064,6 +1501,7 @@ class StudyWorkspace:
                     "Tasks without a deadline are available in the Tasks list and "
                     "do not appear on calendar dates.",
                     size=12,
+                    color=palette.secondary_text,
                 ),
             ],
             spacing=8,
@@ -1079,6 +1517,15 @@ class StudyWorkspace:
         year = self.displayed_month.year + month_index // 12
         month = month_index % 12 + 1
         self.displayed_month = date(year, month, 1)
+        _, number_of_days = monthrange(year, month)
+        self.selected_day = date(
+            year, month, min(self.selected_day.day, number_of_days)
+        )
+        self.page.run_task(self.show, "calendar")
+
+    def _go_to_today(self) -> None:
+        self.selected_day = date.today()
+        self.displayed_month = self.selected_day.replace(day=1)
         self.page.run_task(self.show, "calendar")
 
     def _settings_screen(self) -> ft.Control:
@@ -1105,41 +1552,6 @@ class StudyWorkspace:
                             dark_mode,
                         ],
                         spacing=6,
-                    ),
-                    padding=14,
-                    bgcolor=self._surface_color(),
-                    border_radius=12,
-                ),
-                ft.Divider(),
-                ft.Text("Notifications", size=18, weight=ft.FontWeight.BOLD),
-                ft.Container(
-                    content=ft.Row(
-                        controls=[
-                            ft.Icon(
-                                ft.Icons.NOTIFICATIONS_OUTLINED,
-                                color=self._secondary_text_color(),
-                            ),
-                            ft.Column(
-                                controls=[
-                                    ft.Text(
-                                        "Deadline reminders",
-                                        weight=ft.FontWeight.W_500,
-                                    ),
-                                    ft.Text(
-                                        "Notifications are not configured in this version.",
-                                        size=12,
-                                        color=self._secondary_text_color(),
-                                    ),
-                                ],
-                                spacing=3,
-                                expand=True,
-                            ),
-                            ft.Text(
-                                "Unavailable",
-                                size=12,
-                                color=self._secondary_text_color(),
-                            ),
-                        ]
                     ),
                     padding=14,
                     bgcolor=self._surface_color(),
@@ -1183,16 +1595,21 @@ class StudyWorkspace:
 
     def _set_dark_mode(self, event: Any) -> None:
         self.dark_mode = bool(event.control.value)
-        self.page.theme_mode = (
-            ft.ThemeMode.DARK if self.dark_mode else ft.ThemeMode.LIGHT
-        )
+        apply_theme(self.page, self.dark_mode)
+        notice = ""
+        try:
+            save_dark_mode(self.dark_mode)
+        except OSError as error:
+            logger.warning("Could not persist appearance preference: %s", error)
+            notice = "Appearance changed, but could not be saved for next time."
         if self.auth.session is not None:
-            self._render(self.auth.session)
+            self._render(self.auth.session, notice=notice)
         else:
             self.page.update()
 
     def _profile_screen(self, session: AuthSession) -> ft.Control:
         async def logout(_: Any) -> None:
+            self._load_request_id += 1
             self.auth.logout()
             self._invalidate_ai_requests()
             self._clear_account_data()

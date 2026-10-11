@@ -4,6 +4,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -22,10 +23,14 @@ class AuthSession:
 
 class FirebaseAuthService:
     _AUTH_URL = "https://identitytoolkit.googleapis.com/v1/accounts"
+    _TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, session_path: Path | None = None) -> None:
         self._api_key = api_key.strip()
         self._session: AuthSession | None = None
+        self._session_path = session_path or (
+            Path.home() / ".smart-study-task-manager" / "session.json"
+        )
 
     @property
     def session(self) -> AuthSession | None:
@@ -43,8 +48,32 @@ class FirebaseAuthService:
             {"email": email, "password": password, "returnSecureToken": True},
         )
 
+    async def restore_session(self) -> AuthSession | None:
+        """Refresh the saved Firebase session without retaining a password."""
+        try:
+            saved = json.loads(self._session_path.read_text(encoding="utf-8"))
+            refresh_token = saved["refresh_token"]
+            email = saved.get("email", "")
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            return None
+        if not isinstance(refresh_token, str) or not refresh_token:
+            return None
+        try:
+            response = await asyncio.to_thread(self._refresh, refresh_token)
+            session = AuthSession(
+                uid=response["user_id"], email=email, id_token=response["id_token"],
+                refresh_token=response["refresh_token"], expires_in=response["expires_in"],
+            )
+        except (FirebaseAuthError, KeyError, TypeError):
+            self._clear_saved_session()
+            return None
+        self._session = session
+        self._save_session(session)
+        return session
+
     def logout(self) -> None:
         self._session = None
+        self._clear_saved_session()
 
     async def _authenticate(
         self, operation: str, payload: dict[str, str | bool]
@@ -69,7 +98,39 @@ class FirebaseAuthService:
             ) from error
 
         self._session = session
+        self._save_session(session)
         return session
+
+    def _refresh(self, refresh_token: str) -> dict[str, Any]:
+        url = f"{self._TOKEN_URL}?key={urllib.parse.quote(self._api_key, safe='')}"
+        request = urllib.request.Request(
+            url,
+            data=urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh_token}).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise FirebaseAuthError("Could not restore the saved session.") from error
+        if not isinstance(payload, dict):
+            raise FirebaseAuthError("Firebase returned an invalid session response.")
+        return payload
+
+    def _save_session(self, session: AuthSession) -> None:
+        try:
+            self._session_path.parent.mkdir(parents=True, exist_ok=True)
+            self._session_path.write_text(json.dumps({"email": session.email, "refresh_token": session.refresh_token}), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _clear_saved_session(self) -> None:
+        try:
+            self._session_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
     def _post_json(self, operation: str, payload: dict[str, str | bool]) -> dict[str, Any]:
         url = (

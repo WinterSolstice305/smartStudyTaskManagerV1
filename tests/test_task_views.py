@@ -88,6 +88,18 @@ class TaskViewTests(unittest.TestCase):
             date(2026, 8, 1),
         )
 
+    def test_month_grid_aligns_sunday_start_and_handles_four_to_six_weeks(self) -> None:
+        four_week_month = month_grid(2015, 2)
+        five_week_month = month_grid(2024, 2)
+        six_week_month = month_grid(2021, 5)
+
+        self.assertEqual(len(four_week_month), 28)
+        self.assertEqual(len(five_week_month), 35)
+        self.assertEqual(len(six_week_month), 42)
+        self.assertEqual(four_week_month[0], date(2015, 2, 1))
+        self.assertEqual(five_week_month[4], date(2024, 2, 1))
+        self.assertEqual(six_week_month[6], date(2021, 5, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -154,7 +154,11 @@ class GeminiServiceTests(unittest.TestCase):
             with (
                 patch.dict(
                     os.environ,
-                    {"GEMINI_API_KEY": "test-key", "GEMINI_MODEL": "test-flash"},
+                    {
+                        "GEMINI_BACKEND_URL": "direct",
+                        "GEMINI_API_KEY": "test-key",
+                        "GEMINI_MODEL": "test-flash",
+                    },
                 ),
                 patch("app.services.gemini.genai.Client", FakeClient),
             ):
@@ -218,7 +222,11 @@ class GeminiServiceTests(unittest.TestCase):
 
     def test_missing_api_key_returns_a_user_safe_error(self) -> None:
         async def exercise() -> None:
-            with patch.dict(os.environ, {}, clear=True):
+            with patch.dict(
+                os.environ,
+                {"GEMINI_BACKEND_URL": "direct"},
+                clear=True,
+            ):
                 with self.assertRaisesRegex(GeminiServiceError, "GEMINI_API_KEY"):
                     await chat_about_tasks("Plan my week", [])
 
@@ -244,11 +252,134 @@ class GeminiServiceTests(unittest.TestCase):
 
         async def exercise() -> None:
             with (
-                patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "GEMINI_BACKEND_URL": "direct",
+                        "GEMINI_API_KEY": "test-key",
+                    },
+                ),
                 patch("app.services.gemini.genai.Client", FakeClient),
             ):
                 with self.assertRaisesRegex(GeminiServiceError, "Could not reach Gemini"):
                     await chat_about_tasks("Plan my week", [])
+
+        asyncio.run(exercise())
+
+    def test_backend_requests_use_firebase_bearer_token_without_client_key(self) -> None:
+        requests: list[
+            tuple[str, dict[str, object], dict[str, str]]
+        ] = []
+
+        class FakeBackendClient:
+            def __init__(self, *, timeout: float) -> None:
+                self.timeout = timeout
+
+            async def __aenter__(self) -> "FakeBackendClient":
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+            async def post(
+                self,
+                url: str,
+                *,
+                json: dict[str, object],
+                headers: dict[str, str],
+            ) -> httpx.Response:
+                requests.append((url, json, headers))
+                return httpx.Response(
+                    200,
+                    json={"text": "Plan one focused study block."},
+                    request=httpx.Request("POST", url),
+                )
+
+        async def exercise() -> None:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "GEMINI_BACKEND_URL": "https://ai.example.test/generateGemini",
+                        "GEMINI_API_KEY": "must-not-be-used",
+                    },
+                ),
+                patch(
+                    "app.services.gemini.httpx.AsyncClient",
+                    FakeBackendClient,
+                ),
+            ):
+                response = await gemini._generate_text(
+                    "Plan my week",
+                    system_instruction="Use study context.",
+                    max_output_tokens=700,
+                    id_token="firebase-id-token",
+                )
+
+            self.assertEqual(response, "Plan one focused study block.")
+            self.assertEqual(requests[0][0], "https://ai.example.test/generateGemini")
+            request_headers = requests[0][2]
+            self.assertEqual(
+                request_headers["Authorization"], "Bearer firebase-id-token"
+            )
+            request_body = requests[0][1]
+            self.assertNotIn("must-not-be-used", str(request_body))
+
+        asyncio.run(exercise())
+
+    def test_backend_quota_error_is_actionable_and_logs_no_response_body(self) -> None:
+        class FakeBackendClient:
+            def __init__(self, *, timeout: float) -> None:
+                self.timeout = timeout
+
+            async def __aenter__(self) -> "FakeBackendClient":
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+            async def post(
+                self,
+                url: str,
+                *,
+                json: dict[str, object],
+                headers: dict[str, str],
+            ) -> httpx.Response:
+                _ = json, headers
+                return httpx.Response(
+                    429,
+                    json={
+                        "error": {
+                            "code": "GEMINI_DAILY_LIMIT",
+                            "message": "sensitive-backend-detail",
+                        }
+                    },
+                    request=httpx.Request("POST", url),
+                )
+
+        async def exercise() -> None:
+            with (
+                patch.dict(
+                    os.environ,
+                    {"GEMINI_BACKEND_URL": "https://ai.example.test/generateGemini"},
+                ),
+                patch("app.services.gemini.httpx.AsyncClient", FakeBackendClient),
+                self.assertLogs(gemini.logger, level="WARNING") as captured,
+            ):
+                with self.assertRaisesRegex(
+                    GeminiServiceError, "today's AI request limit"
+                ):
+                    await gemini._generate_text(
+                        "Plan my week",
+                        system_instruction="Use study context.",
+                        max_output_tokens=700,
+                        id_token="firebase-id-token",
+                    )
+
+            diagnostic = "\n".join(captured.output)
+            self.assertIn("category=user_daily_limit", diagnostic)
+            self.assertIn("status=429", diagnostic)
+            self.assertNotIn("sensitive-backend-detail", diagnostic)
 
         asyncio.run(exercise())
 
@@ -275,12 +406,73 @@ class GeminiServiceTests(unittest.TestCase):
 
         async def exercise() -> None:
             with (
-                patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "GEMINI_BACKEND_URL": "direct",
+                        "GEMINI_API_KEY": "test-key",
+                    },
+                ),
                 patch("app.services.gemini.genai.Client", FakeClient),
                 patch.object(gemini.errors, "APIError", FakeAPIError),
             ):
-                with self.assertRaisesRegex(GeminiServiceError, "rate-limited"):
+                with self.assertRaisesRegex(GeminiServiceError, "quota or rate limit"):
                     await chat_about_tasks("Plan my week", [])
+
+        asyncio.run(exercise())
+
+    def test_api_status_is_logged_without_error_body_or_credentials(self) -> None:
+        api_error = gemini.errors.APIError(
+            503,
+            {
+                "error": {
+                    "status": "UNAVAILABLE",
+                    "message": "sensitive-response-detail",
+                }
+            },
+        )
+
+        class FakeAsyncClient:
+            class Models:
+                async def generate_content(self, **_: object) -> object:
+                    raise api_error
+
+            models = Models()
+
+            async def __aenter__(self) -> "FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *_: object) -> None:
+                return None
+
+        class FakeClient:
+            def __init__(self, **_: object) -> None:
+                self.aio = FakeAsyncClient()
+
+        async def exercise() -> None:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "GEMINI_BACKEND_URL": "direct",
+                        "GEMINI_API_KEY": "sensitive-api-key",
+                        "GEMINI_MODEL": "gemini-3.8-flash",
+                    },
+                ),
+                patch("app.services.gemini.genai.Client", FakeClient),
+                self.assertLogs(gemini.logger, level="WARNING") as captured,
+            ):
+                with self.assertRaisesRegex(
+                    GeminiServiceError, "temporarily unavailable"
+                ):
+                    await chat_about_tasks("Plan my week", [])
+
+            diagnostic = "\n".join(captured.output)
+            self.assertIn("category=upstream_server", diagnostic)
+            self.assertIn("status=503", diagnostic)
+            self.assertIn("model=gemini-3.8-flash", diagnostic)
+            self.assertNotIn("sensitive-api-key", diagnostic)
+            self.assertNotIn("sensitive-response-detail", diagnostic)
 
         asyncio.run(exercise())
 
@@ -337,6 +529,9 @@ class GeminiServiceTests(unittest.TestCase):
             ) as recommend:
                 await workspace._request_recommendations()
             self.assertEqual(recommend.await_args.args[0], (task_b,))
+            self.assertEqual(
+                recommend.await_args.kwargs["id_token"], "token-user-b"
+            )
             self.assertNotIn(task_a, recommend.await_args.args[0])
 
         asyncio.run(exercise())
@@ -355,8 +550,13 @@ class GeminiServiceTests(unittest.TestCase):
             finish = asyncio.Event()
 
             async def delayed_recommendation(
-                tasks: object, subjects: object
+                tasks: object,
+                subjects: object,
+                *,
+                id_token: str | None = None,
             ) -> TaskRecommendationResult:
+                _ = tasks, subjects
+                self.assertEqual(id_token, "token-user-a")
                 started.set()
                 await finish.wait()
                 return TaskRecommendationResult("Done.", ())
