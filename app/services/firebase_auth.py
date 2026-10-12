@@ -4,8 +4,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from app.services.local_store import LocalStore
+from app.services.study_cache import StudyCache
 
 
 class FirebaseAuthError(Exception):
@@ -19,6 +23,7 @@ class AuthSession:
     id_token: str
     refresh_token: str
     expires_in: str
+    is_guest: bool = False
 
 
 class FirebaseAuthService:
@@ -31,6 +36,8 @@ class FirebaseAuthService:
         self._session_path = session_path or (
             Path.home() / ".smart-study-task-manager" / "session.json"
         )
+        self._guest_store = LocalStore()
+        self._study_cache = StudyCache()
 
     @property
     def session(self) -> AuthSession | None:
@@ -48,8 +55,16 @@ class FirebaseAuthService:
             {"email": email, "password": password, "returnSecureToken": True},
         )
 
+    async def login_as_guest(self) -> AuthSession:
+        self._session = AuthSession("guest", "", "", "", "0", is_guest=True)
+        return self._session
+
     async def restore_session(self) -> AuthSession | None:
-        """Refresh the saved Firebase session without retaining a password."""
+        """Restore a saved session, using its locally cached token when offline.
+
+        This never authenticates a new user offline. It only restores a session
+        that was previously authenticated and persisted on this device.
+        """
         try:
             saved = json.loads(self._session_path.read_text(encoding="utf-8"))
             refresh_token = saved["refresh_token"]
@@ -65,9 +80,26 @@ class FirebaseAuthService:
                 refresh_token=response["refresh_token"], expires_in=response["expires_in"],
             )
         except (FirebaseAuthError, KeyError, TypeError):
-            self._clear_saved_session()
-            return None
+            # A refresh needs connectivity. If the previously issued ID token
+            # is still valid, it can authorize only locally cached data.
+            id_token = saved.get("id_token", "")
+            uid = saved.get("uid", "")
+            expires_at = saved.get("expires_at", 0)
+            if not isinstance(id_token, str) or not id_token or not isinstance(uid, str) or not uid:
+                return None
+            session = AuthSession(
+                uid=uid,
+                email=email,
+                id_token=id_token,
+                refresh_token=refresh_token,
+                expires_in=str(max(0, int(expires_at - datetime.now(timezone.utc).timestamp())))
+                if isinstance(expires_at, (int, float)) else "0",
+            )
+            self._session = session
+            return session
         self._session = session
+        self._guest_store.clear()
+        self._study_cache.clear("guest")
         self._save_session(session)
         return session
 
@@ -98,6 +130,8 @@ class FirebaseAuthService:
             ) from error
 
         self._session = session
+        self._guest_store.clear()
+        self._study_cache.clear("guest")
         self._save_session(session)
         return session
 
@@ -120,7 +154,20 @@ class FirebaseAuthService:
     def _save_session(self, session: AuthSession) -> None:
         try:
             self._session_path.parent.mkdir(parents=True, exist_ok=True)
-            self._session_path.write_text(json.dumps({"email": session.email, "refresh_token": session.refresh_token}), encoding="utf-8")
+            try:
+                lifetime = max(0, int(session.expires_in))
+            except (TypeError, ValueError):
+                lifetime = 3600
+            self._session_path.write_text(
+                json.dumps({
+                    "uid": session.uid,
+                    "email": session.email,
+                    "id_token": session.id_token,
+                    "refresh_token": session.refresh_token,
+                    "expires_at": datetime.now(timezone.utc).timestamp() + lifetime,
+                }),
+                encoding="utf-8",
+            )
         except OSError:
             pass
 

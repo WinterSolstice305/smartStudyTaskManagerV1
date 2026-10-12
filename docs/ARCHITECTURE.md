@@ -1,6 +1,10 @@
 # Architecture
 
-This project is a single-user desktop client built with Python and Flet. It connects directly to Firebase Authentication and Firestore from the client using the Firebase REST APIs. There is no server-side backend or API layer in this repository.
+This project is a single-user desktop client built with Python and Flet. It
+connects directly to Firebase Authentication and Firestore through REST APIs.
+Gemini requests normally pass through the repository's authenticated Firebase
+Cloud Function; direct Gemini access is available only when explicitly enabled
+for local development.
 
 ## Architectural overview
 
@@ -9,6 +13,8 @@ The runtime is organized around a small set of layers:
 - Entry point: `main.py` creates the Flet page and boots the workspace.
 - UI layer: `app/ui` renders screens, dialogs, filters, and task/subject actions.
 - Service layer: `app/services` wraps Firebase Auth, Firestore, and Gemini calls.
+- Function layer: `functions/` verifies Firebase ID tokens and performs
+  server-side Gemini calls.
 - Domain layer: `app/models` validates and serializes `Subject` and `Task` objects.
 - Configuration: `app/config.py` reads environment variables for Firebase and Gemini.
 
@@ -43,7 +49,10 @@ This service uses the Google Identity Toolkit REST API to sign up or sign in a u
 - `refresh_token`
 - `expires_in`
 
-The session is kept in memory only; there is no persistent token cache.
+After authentication, the service saves the email and refresh token in the
+user profile directory. On startup, `main.py` calls `restore_session()`, which
+uses Firebase Secure Token to obtain a new ID token. Logout deletes the saved
+session file.
 
 ### `app.services.firestore.FirestoreService`
 
@@ -68,7 +77,24 @@ Provides two read-only AI functions:
 - `generate_task_recommendations(tasks, subjects=None)`
 - `chat_about_tasks(message, tasks, subjects=None)`
 
-They send the current task snapshot to Gemini and never write to Firestore.
+They send the current task snapshot and the Firebase ID token to the configured
+backend. The default is the `generateGemini` Cloud Function derived from
+`FIREBASE_PROJECT_ID`; `GEMINI_BACKEND_URL=direct` instead calls Gemini with a
+local key. They never write task or subject documents to Firestore.
+
+### `app.services.study_cache.StudyCache` and `app.ui.theme`
+
+`StudyCache` keeps a per-user local snapshot of task and subject data. At
+initial startup, the workspace can show that snapshot while it refreshes from
+Firestore. The theme module persists the selected light/dark preference. These
+files provide local convenience state, not cross-device synchronization.
+
+### `functions/index.js`
+
+Exports the `generateGemini` HTTPS Cloud Function in `us-central1`. It requires
+a Firebase bearer token, validates the allowed payload, retrieves the Gemini
+key from Firebase Secret Manager, and tracks a 30-request-per-user UTC-day
+limit in the `_gemini_usage` collection using the Admin SDK.
 
 ## Startup sequence
 
@@ -84,8 +110,14 @@ sequenceDiagram
     User->>main: Launch app
     main->>Auth: FirebaseAuthService(FIREBASE_API_KEY)
     main->>Workspace: StudyWorkspace(page, auth, project_id, callback)
-    main->>Workspace: show_login()
-    Workspace-->>Page: Render login UI
+    main->>Auth: restore_session()
+    alt saved session can be refreshed
+        Auth-->>main: restored session
+        main->>Workspace: show("home")
+    else no usable saved session
+        main->>Workspace: show_login()
+    end
+    Workspace-->>Page: Render login UI or workspace
     User->>Page: Enter email/password
     Page->>Auth: login(email, password)
     Auth->>Firebase: Identity Toolkit REST API
@@ -153,17 +185,25 @@ Write operations follow the same path with a user-scoped resource path and an ID
 sequenceDiagram
     participant Workspace as StudyWorkspace
     participant Gemini as app.services.gemini
+    participant Function as generateGemini Cloud Function
     participant API as Gemini API
+    participant Usage as Firestore usage counter
 
-    Workspace->>Gemini: generate_task_recommendations(tasks, subjects)
+    Workspace->>Gemini: generate_task_recommendations(tasks, subjects, id_token)
     Gemini->>Gemini: filter incomplete tasks, sort by urgency
-    Gemini->>API: generated prompt + schema
-    API-->>Gemini: JSON response
+    Gemini->>Function: POST prompt + schema + Firebase bearer token
+    Function->>Function: verify ID token and validate payload
+    Function->>Usage: transactionally consume daily request
+    Function->>API: generated prompt + schema
+    API-->>Function: response
+    Function-->>Gemini: JSON response
     Gemini-->>Workspace: TaskRecommendationResult
     Workspace-->>UI: render recommendation cards
 ```
 
-The Gemini flow is intentionally read-only. The UI passes a snapshot of the user’s tasks and subjects; the AI service never directly writes to Firestore.
+The Gemini flow is intentionally read-only for task and subject data. The
+function does write its server-managed daily usage counter. In direct mode the
+client bypasses the function and calls Gemini with a local development key.
 
 ## Error-handling strategy
 
@@ -180,8 +220,11 @@ This keeps the presentation layer from dealing with raw network payloads while s
 
 The app uses a simple in-memory state model:
 
-- The authenticated session is stored in `FirebaseAuthService._session`.
+- The active authenticated session is stored in `FirebaseAuthService._session`;
+  a refresh token is also saved locally for startup restoration.
 - `StudyWorkspace` retains the current user’s task and subject caches.
+- `StudyCache` persists a per-user snapshot for initial rendering while a
+  Firestore refresh is pending.
 - Routes and filter state are stored on the workspace instance.
 - AI request state (`_recommendation_loading`, `_chat_loading`, `_recommendation_result`, etc.) is kept alongside the workspace.
 
@@ -201,17 +244,22 @@ This means tasks, subjects, and any other docs under a user’s tree cannot be a
 
 - Firebase Authentication via Identity Toolkit REST API
 - Firestore via REST API
-- Gemini via Google GenAI client
+- Gemini via a Firebase Cloud Function and Google GenAI; direct local calls are
+  an explicit fallback
 - Flet for the desktop UI
 
-The app does not use a custom backend, queueing system, or local database.
+The app has no general-purpose application backend, queueing system, or local
+database. Its Cloud Function is limited to protected Gemini requests and usage
+accounting.
 
 ## Notable architectural trade-offs
 
 - Client-side Firebase access keeps the project small and easy to run locally, but it exposes the Firebase web API key and the app’s data access pattern to the client runtime.
 - Firestore security is enforced by rules, but the app’s trust model assumes the client only uses the authenticated user’s own data.
-- AI recommendations are computed from a task snapshot and never mutate the underlying data model, which keeps the feature read-only and predictable.
-- The app keeps all session and cache state in memory, which is simple but means reloading the app resets the current client-side state.
+- AI recommendations are computed from a task snapshot and never mutate the
+  underlying task/subject model; the server only records request usage.
+- Local session, cache, and appearance state improve startup continuity but are
+  device-local and not an offline synchronization solution.
 
 ## Current implementation status
 
@@ -224,4 +272,7 @@ The repo contains an operational client for:
 - AI recommendations and chat via Gemini
 - Firebase security rules and rule tests
 
-The repository is not a full production backend or a multi-user service platform. It is a client-only application with Firebase backend dependencies and mocked/tested service logic.
+The repository is not a full production backend or a multi-user service
+platform. It is a Firebase-backed client with a narrowly scoped function for
+AI requests; live function deployment and live Gemini behavior remain
+unverified in this repository.

@@ -28,6 +28,8 @@ _MAX_RECOMMENDATION_TASKS = 40
 _MAX_CHAT_TASKS = 30
 _MAX_RECOMMENDATIONS = 5
 _MAX_MESSAGE_LENGTH = 2_000
+_MAX_CHAT_RESPONSE_TOKENS = 4_000
+_MAX_CHAT_RESPONSE_CHARS = 20_000
 _PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -212,14 +214,14 @@ async def chat_about_tasks(
     response_text = await _generate_text(
         prompt,
         system_instruction=_CHAT_INSTRUCTIONS,
-        max_output_tokens=700,
+        max_output_tokens=_MAX_CHAT_RESPONSE_TOKENS,
         id_token=id_token,
     )
     if not response_text.strip():
         raise GeminiServiceError(
             "Gemini returned an empty answer. Please try again."
         )
-    return response_text.strip()[:4_000]
+    return response_text.strip()
 
 
 async def _generate_text(
@@ -229,6 +231,55 @@ async def _generate_text(
     response_schema: dict[str, Any] | None = None,
     max_output_tokens: int,
     id_token: str | None = None,
+) -> str:
+    backend_setting = os.environ.get("GEMINI_BACKEND_URL", "").strip()
+    if backend_setting.casefold() != "direct":
+        return await _generate_with_gemini(
+            prompt,
+            system_instruction=system_instruction,
+            response_schema=response_schema,
+            max_output_tokens=max_output_tokens,
+            id_token=id_token,
+            model=None,
+        )
+
+    if not os.environ.get("GEMINI_API_KEY", "").strip():
+        logger.warning("Gemini is not configured: GEMINI_API_KEY is unavailable.")
+        raise GeminiServiceError(
+            "AI assistance is not configured. Set GEMINI_API_KEY in the repository "
+            ".env file and restart the app."
+        )
+
+    last_error: GeminiServiceError | None = None
+    for model in _configured_models():
+        try:
+            return await _generate_with_gemini(
+                prompt,
+                system_instruction=system_instruction,
+                response_schema=response_schema,
+                max_output_tokens=max_output_tokens,
+                id_token=id_token,
+                model=model,
+            )
+        except GeminiServiceError as error:
+            last_error = error
+            logger.warning("Gemini model failed; trying the next configured model: model=%s", model)
+            if "Could not reach" in str(error) or "took too long" in str(error):
+                break
+    raise GeminiServiceError(
+        "Gemini AI is currently unavailable. All configured Gemini models failed; "
+        "check the model configuration, quota, and network connection."
+    ) from last_error
+
+
+async def _generate_with_gemini(
+    prompt: str,
+    *,
+    system_instruction: str,
+    response_schema: dict[str, Any] | None,
+    max_output_tokens: int,
+    id_token: str | None = None,
+    model: str | None = None,
 ) -> str:
     backend_setting = os.environ.get("GEMINI_BACKEND_URL", "").strip()
     if backend_setting.casefold() != "direct":
@@ -254,7 +305,8 @@ async def _generate_text(
             "GEMINI_API_KEY in the repository .env file and restart the app. "
             "Android builds require a trusted backend; do not package this key."
         )
-    model = os.environ.get("GEMINI_MODEL", _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
+    if not model:
+        model = _DEFAULT_MODEL
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
@@ -350,6 +402,13 @@ async def _generate_text(
             "Gemini returned an empty or invalid response. Please retry."
         )
     return text.strip()
+
+
+def _configured_models() -> tuple[str, ...]:
+    primary = os.environ.get("GEMINI_MODEL", _DEFAULT_MODEL).strip() or _DEFAULT_MODEL
+    configured = os.environ.get("GEMINI_MODEL_FALLBACKS", "")
+    fallbacks = tuple(model.strip() for model in configured.split(",") if model.strip())
+    return tuple(dict.fromkeys((primary, *fallbacks)))
 
 
 def _default_backend_url() -> str:

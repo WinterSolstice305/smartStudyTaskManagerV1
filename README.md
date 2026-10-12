@@ -121,16 +121,9 @@ flutter build apk
 
 Treat this as a development-stage command until the project’s Android workflow is locally validated.
 
-For the educational demo APK, include the local `.env` file so the app can use
-the direct Gemini configuration:
-
-```powershell
-flet build apk --include .env
-```
-
-This deliberately embeds `GEMINI_API_KEY` in the APK. It is appropriate only
-for this private school-project build; do not distribute that APK or reuse the
-key in a public release.
+Do not include a local `.env` containing `GEMINI_API_KEY` in an APK. Packaged
+clients should use the authenticated Cloud Function; the direct mode is for
+local development only.
 
 ## Documentation index
 
@@ -143,7 +136,12 @@ key in a public release.
 
 ## Known limitations and caveats
 
-- The repo uses in-memory session state; re-launching the app clears the current Firebase client session.
+- After a successful sign-in, the app stores the refresh token locally and
+  attempts to restore the Firebase session at the next launch. Logging out
+  removes that saved session.
+- The app also keeps a per-user local task/subject snapshot to render while a
+  startup refresh is in progress. This snapshot is a convenience cache, not an
+  offline editing mode.
 - The app stores data under `/users/{uid}/...`, so user isolation is enforced by Firestore rules, not by a separate backend.
 - The default Firebase API key and project ID in source are demo configuration,
   not a production configuration.

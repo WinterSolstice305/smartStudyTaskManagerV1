@@ -132,6 +132,20 @@ Firestore paths are created as:
 
 All user operations are scoped to this UID by `FirestoreService._user_collection_path()`.
 
+## Server-managed AI usage record
+
+When the Cloud Function is deployed, it writes one usage document per user at:
+
+```text
+/_gemini_usage/{base64url(uid)}
+```
+
+The document contains the current UTC `day`, the accepted request `count`, and
+an `updatedAt` server timestamp. It is used only to enforce the function's
+30-request daily limit. The Admin SDK writes it outside the client-side task
+and subject model, and it should not be treated as a user profile or exposed in
+the app UI.
+
 ## Document ID strategy
 
 The repo uses either:

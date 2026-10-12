@@ -113,7 +113,10 @@ The app writes user-scoped collections under the pattern:
 - `/users/{uid}/tasks`
 - `/users/{uid}/subjects`
 
-No other collection path is used by the app logic. Documents are created under the current signed-in user’s UID, so there is no cross-user access in normal app flows.
+Task and subject documents are created under the current signed-in user’s UID,
+so there is no cross-user access in normal app flows. The deployed Cloud
+Function separately maintains a server-only `_gemini_usage` collection for AI
+rate limiting; it is not part of the client domain model.
 
 Create the database and deploy the rules before using the app.
 

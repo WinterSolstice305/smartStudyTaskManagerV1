@@ -19,6 +19,7 @@ def show(
     password = ft.TextField(label="Password", password=True, width=320)
     error = ft.Text(visible=False)
     login_button = ft.Button(content="Log in", width=320)
+    guest_button = ft.Button(content="Continue as guest", width=320)
 
     async def submit() -> None:
         if not email.value or not email.value.strip() or not password.value:
@@ -38,7 +39,43 @@ def show(
 
         on_authenticated()
 
+    async def submit_guest() -> None:
+        login_button.disabled = True
+        guest_button.disabled = True
+        error.visible = False
+        try:
+            await auth.login_as_guest()
+        except FirebaseAuthError as auth_error:
+            error.value = str(auth_error)
+            error.visible = True
+            login_button.disabled = False
+            guest_button.disabled = False
+            return
+        on_authenticated()
+
+    def confirm_guest(_: object) -> None:
+        async def continue_as_guest(_: object) -> None:
+            page.pop_dialog()
+            await submit_guest()
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Continue as guest?"),
+                content=ft.Text(
+                    "Guest data is stored locally and will be permanently lost "
+                    "when any user logs in. Continue?"
+                ),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog()),
+                    ft.Button(content="Continue", on_click=continue_as_guest),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+        )
+
     login_button.on_click = submit
+    guest_button.on_click = confirm_guest
     page.clean()
     page.add(
         ft.Container(
@@ -50,6 +87,7 @@ def show(
                     password,
                     error,
                     login_button,
+                    guest_button,
                     ft.TextButton(
                         "Create an account", on_click=lambda _: on_register()
                     ),

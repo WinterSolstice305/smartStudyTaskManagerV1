@@ -57,11 +57,24 @@ def colors_for(dark_mode: bool) -> ThemeColors:
     return DARK if dark_mode else LIGHT
 
 
-def apply_theme(page: ft.Page, dark_mode: bool) -> None:
+FONT_SCALES = {"small": 0.9, "default": 1.0, "large": 1.15}
+
+
+def apply_theme(page: ft.Page, dark_mode: bool, font_size: str = "default") -> None:
     palette = colors_for(dark_mode)
     page.theme = ft.Theme(color_scheme_seed=LIGHT.primary, use_material3=True)
     page.dark_theme = ft.Theme(color_scheme_seed=DARK.primary, use_material3=True)
     page.theme_mode = ft.ThemeMode.DARK if dark_mode else ft.ThemeMode.LIGHT
+    page.theme.text_theme = ft.TextTheme(
+        body_large=ft.TextStyle(size=16 * FONT_SCALES.get(font_size, 1.0)),
+        body_medium=ft.TextStyle(size=14 * FONT_SCALES.get(font_size, 1.0)),
+        body_small=ft.TextStyle(size=12 * FONT_SCALES.get(font_size, 1.0)),
+        title_large=ft.TextStyle(size=22 * FONT_SCALES.get(font_size, 1.0)),
+        title_medium=ft.TextStyle(size=18 * FONT_SCALES.get(font_size, 1.0)),
+        title_small=ft.TextStyle(size=16 * FONT_SCALES.get(font_size, 1.0)),
+        headline_small=ft.TextStyle(size=24 * FONT_SCALES.get(font_size, 1.0)),
+    )
+    page.dark_theme.text_theme = page.theme.text_theme
     page.bgcolor = palette.background
 
 
@@ -84,10 +97,26 @@ def load_dark_mode() -> bool:
     return settings.get("dark_mode") is True
 
 
+def load_font_size() -> str:
+    try:
+        with _preferences_path().open(encoding="utf-8") as preferences_file:
+            settings = json.load(preferences_file)
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return "default"
+    value = settings.get("font_size") if isinstance(settings, dict) else None
+    return value if value in FONT_SCALES else "default"
+
+
 def save_dark_mode(dark_mode: bool) -> None:
+    save_appearance(dark_mode, load_font_size())
+
+
+def save_appearance(dark_mode: bool, font_size: str) -> None:
+    if font_size not in FONT_SCALES:
+        font_size = "default"
     path = _preferences_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(".tmp")
     with temporary_path.open("w", encoding="utf-8") as preferences_file:
-        json.dump({"dark_mode": dark_mode}, preferences_file)
+        json.dump({"dark_mode": dark_mode, "font_size": font_size}, preferences_file)
     temporary_path.replace(path)

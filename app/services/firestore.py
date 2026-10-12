@@ -5,11 +5,13 @@ import math
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
 from app.services.firebase_auth import FirebaseAuthService
+from app.services.local_store import LocalStore
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,18 @@ class FirestoreService:
         self._project_id = project_id.strip()
         if not self._project_id or "/" in self._project_id:
             raise ValueError("A valid Firebase project ID is required.")
+        self._local_store = LocalStore()
+        self._offline_store = LocalStore(
+            LocalStore()._path.parent / "authenticated-offline-data.json"
+        )
+        self._queue_path = LocalStore()._path.parent / "sync-queue.json"
+        self.offline = False
+
+    def seed_offline_snapshot(self, uid: str, collection: str, documents: list[FirestoreDocument]) -> None:
+        self._offline_store.replace(
+            self._offline_collection(uid, collection),
+            {document.document_id: document.data for document in documents},
+        )
 
     async def create_document(
         self,
@@ -44,17 +58,29 @@ class FirestoreService:
         data: dict[str, Any],
         document_id: str | None = None,
     ) -> str:
+        if self._is_guest():
+            return self._local_store.create(collection, data, document_id)
+        session = self._auth.session
+        if session is None:
+            raise AuthenticationRequiredError("Sign in before accessing Firestore data.")
         collection_path = self._user_collection_path(collection)
         query: dict[str, str | int] = {}
         if document_id is not None:
             query["documentId"] = self._validate_document_id(document_id)
-        response = await asyncio.to_thread(
-            self._request,
-            "POST",
-            collection_path,
-            {"fields": self._encode_fields(data)},
-            query,
-        )
+        try:
+            await self._flush_pending(session.uid)
+            response = await asyncio.to_thread(
+                self._request, "POST", collection_path,
+                {"fields": self._encode_fields(data)}, query,
+            )
+        except FirestoreError as error:
+            if not self._is_offline_error(error):
+                raise
+            self.offline = True
+            document_id = document_id or uuid.uuid4().hex
+            self._offline_store.create(self._offline_collection(session.uid, collection), data, document_id)
+            self._queue(session.uid, "create", collection, document_id, data)
+            return document_id
         if response is None:
             raise FirestoreError("Firestore returned an empty document response.")
         name = response.get("name")
@@ -65,10 +91,19 @@ class FirestoreService:
     async def read_document(
         self, collection: str, document_id: str
     ) -> FirestoreDocument | None:
+        if self._is_guest():
+            return self._local_store.read(collection, document_id)
+        session = self._auth.session
+        if session is None:
+            raise AuthenticationRequiredError("Sign in before accessing Firestore data.")
         path = self._document_path(collection, document_id)
-        response = await asyncio.to_thread(
-            self._request, "GET", path, None, None, True
-        )
+        try:
+            response = await asyncio.to_thread(self._request, "GET", path, None, None, True)
+        except FirestoreError as error:
+            if not self._is_offline_error(error):
+                raise
+            self.offline = True
+            return self._offline_store.read(self._offline_collection(session.uid, collection), document_id)
         if response is None:
             return None
         return self._decode_document(response)
@@ -76,6 +111,15 @@ class FirestoreService:
     async def update_document(
         self, collection: str, document_id: str, data: dict[str, Any]
     ) -> None:
+        if self._is_guest():
+            try:
+                self._local_store.update(collection, document_id, data)
+            except KeyError as error:
+                raise FirestoreError("The requested document does not exist.") from error
+            return
+        session = self._auth.session
+        if session is None:
+            raise AuthenticationRequiredError("Sign in before accessing Firestore data.")
         path = self._document_path(collection, document_id)
         fields = self._encode_fields(data)
         if not fields:
@@ -83,21 +127,55 @@ class FirestoreService:
         query = [
             ("updateMask.fieldPaths", self._field_path(name)) for name in fields
         ]
-        await asyncio.to_thread(
-            self._request,
-            "PATCH",
-            path,
-            {"fields": fields},
-            query,
-        )
+        try:
+            await self._flush_pending(session.uid)
+            await asyncio.to_thread(self._request, "PATCH", path, {"fields": fields}, query)
+        except FirestoreError as error:
+            if not self._is_offline_error(error):
+                raise
+            self.offline = True
+            key = self._offline_collection(session.uid, collection)
+            try:
+                self._offline_store.update(key, document_id, data)
+            except KeyError:
+                # The remote document may not have been cached on this device;
+                # retain the operation so it can be applied after reconnecting.
+                pass
+            self._queue(session.uid, "update", collection, document_id, data)
 
     async def delete_document(self, collection: str, document_id: str) -> None:
+        if self._is_guest():
+            try:
+                self._local_store.delete(collection, document_id)
+            except KeyError as error:
+                raise FirestoreError("The requested document does not exist.") from error
+            return
+        session = self._auth.session
+        if session is None:
+            raise AuthenticationRequiredError("Sign in before accessing Firestore data.")
         path = self._document_path(collection, document_id)
-        await asyncio.to_thread(self._request, "DELETE", path, None, None)
+        try:
+            await self._flush_pending(session.uid)
+            await asyncio.to_thread(self._request, "DELETE", path, None, None)
+        except FirestoreError as error:
+            if not self._is_offline_error(error):
+                raise
+            self.offline = True
+            key = self._offline_collection(session.uid, collection)
+            try:
+                self._offline_store.delete(key, document_id)
+            except KeyError:
+                pass
+            self._queue(session.uid, "delete", collection, document_id, {})
 
     async def list_documents(
         self, collection: str
     ) -> list[FirestoreDocument]:
+        if self._is_guest():
+            return self._local_store.list(collection)
+        session = self._auth.session
+        if session is None:
+            raise AuthenticationRequiredError("Sign in before accessing Firestore data.")
         started_at = perf_counter()
         path = self._user_collection_path(collection)
         documents: list[FirestoreDocument] = []
@@ -107,9 +185,14 @@ class FirestoreService:
             if page_token:
                 query["pageToken"] = page_token
             try:
-                response = await asyncio.to_thread(
-                    self._request, "GET", path, None, query
-                )
+                try:
+                    await self._flush_pending(session.uid)
+                    response = await asyncio.to_thread(self._request, "GET", path, None, query)
+                except FirestoreError as error:
+                    if not self._is_offline_error(error):
+                        raise
+                    self.offline = True
+                    return self._offline_store.list(self._offline_collection(session.uid, collection))
             except FirestoreError:
                 logger.warning(
                     "Firestore could not load collection %s after %.2f seconds.",
@@ -133,7 +216,73 @@ class FirestoreService:
                     len(documents),
                     perf_counter() - started_at,
                 )
+                self._offline_store.replace(
+                    self._offline_collection(session.uid, collection),
+                    {document.document_id: document.data for document in documents},
+                )
                 return documents
+
+        # Successful reads become the authenticated user's offline snapshot.
+        # (The return above is intentionally handled below after pagination.)
+
+    def _offline_collection(self, uid: str, collection: str) -> str:
+        return f"{uid}:{collection}"
+
+    @staticmethod
+    def _is_offline_error(error: FirestoreError) -> bool:
+        message = str(error)
+        return "Could not reach Firestore" in message or "internet connection" in message
+
+    def _queue(self, uid: str, operation: str, collection: str, document_id: str, data: dict[str, Any]) -> None:
+        try:
+            try:
+                payload = json.loads(self._queue_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+                payload = []
+            if not isinstance(payload, list):
+                payload = []
+            payload.append({"uid": uid, "operation": operation, "collection": collection, "document_id": document_id, "data": data})
+            self._queue_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._queue_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            temporary.replace(self._queue_path)
+        except OSError:
+            logger.exception("Could not persist the offline synchronization queue.")
+
+    async def _flush_pending(self, uid: str) -> None:
+        try:
+            payload = json.loads(self._queue_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, list):
+            return
+        remaining = []
+        for item in payload:
+            if not isinstance(item, dict) or item.get("uid") != uid:
+                remaining.append(item)
+                continue
+            try:
+                collection = item["collection"]
+                document_id = item["document_id"]
+                operation = item["operation"]
+                path = self._document_path(collection, document_id)
+                if operation == "create":
+                    await asyncio.to_thread(self._request, "PATCH", path, {"fields": self._encode_fields(item["data"])}, None)
+                elif operation == "update":
+                    fields = self._encode_fields(item["data"])
+                    await asyncio.to_thread(self._request, "PATCH", path, {"fields": fields}, [("updateMask.fieldPaths", self._field_path(name)) for name in fields])
+                elif operation == "delete":
+                    await asyncio.to_thread(self._request, "DELETE", path, None, None)
+                else:
+                    remaining.append(item)
+            except (FirestoreError, KeyError, TypeError, ValueError):
+                remaining.append(item)
+                remaining.extend(payload[payload.index(item) + 1 :])
+                break
+        try:
+            self._queue_path.write_text(json.dumps(remaining), encoding="utf-8")
+        except OSError:
+            pass
 
     def _user_collection_path(self, collection: str) -> str:
         session = self._auth.session
@@ -151,6 +300,10 @@ class FirestoreService:
             "/databases/(default)/documents/users/"
             f"{urllib.parse.quote(session.uid, safe='')}/{urllib.parse.quote(collection, safe='')}"
         )
+
+    def _is_guest(self) -> bool:
+        session = self._auth.session
+        return session is not None and session.is_guest
 
     def _document_path(self, collection: str, document_id: str) -> str:
         return (

@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 class StudyWorkspace:
     _ROUTES = ["home", "tasks", "calendar", "settings"]
+    _NAVIGATION_ROUTES = ["home", "tasks", "calendar", "settings"]
     _PRIORITIES = ["high", "medium", "low"]
     _STATUSES = ["pending", "in_progress", "completed"]
     _SORTS = {
@@ -73,6 +74,7 @@ class StudyWorkspace:
         self._data_loading = False
         self._data_available = False
         self._data_error = ""
+        self._offline_mode = False
         self._startup_state = "initializing"
         self._recommendation_loading = False
         self._recommendation_request_id = 0
@@ -134,10 +136,14 @@ class StudyWorkspace:
         if account_changed:
             self._clear_account_data()
             self._data_uid = session.uid
+            self._offline_mode = False
         cached_data = self._study_cache.load(session.uid) if initial_startup else None
         if cached_data is not None:
             self.task_cache, self.subject_cache = cached_data
             self._data_available = True
+            self._offline_mode = False
+            self.firestore.seed_offline_snapshot(session.uid, "tasks", [self.firestore_document(task.id, task.to_firestore()) for task in self.task_cache])
+            self.firestore.seed_offline_snapshot(session.uid, "subjects", [self.firestore_document(subject.id, subject.to_firestore()) for subject in self.subject_cache])
             self._render(
                 session,
                 notice="Showing saved tasks while checking for updates...",
@@ -162,6 +168,7 @@ class StudyWorkspace:
             if load_request_id != self._load_request_id:
                 return
             self._data_available = True
+            self._offline_mode = self.firestore.offline
             self._data_error = ""
             self._startup_state = "ready"
             self._study_cache.save(session.uid, self.task_cache, self.subject_cache)
@@ -193,6 +200,7 @@ class StudyWorkspace:
                 error,
             )
             error_message = str(error)
+            self._offline_mode = "Could not reach" in error_message or "internet connection" in error_message
             if account_changed:
                 self.task_cache = []
                 self.subject_cache = []
@@ -284,10 +292,17 @@ class StudyWorkspace:
     async def _load_collections(self) -> tuple[list[Task], list[Subject]]:
         import asyncio
 
+        self.firestore.offline = False
         tasks, subjects = await asyncio.gather(
             self.tasks.get_tasks(), self.subjects.get_subjects()
         )
         return tasks, subjects
+
+    @staticmethod
+    def firestore_document(document_id: str, data: dict[str, Any]) -> Any:
+        from app.services.firestore import FirestoreDocument
+
+        return FirestoreDocument(document_id, data)
 
     def _render(
         self, session: AuthSession, *, notice: str = "", error: str = ""
@@ -383,6 +398,7 @@ class StudyWorkspace:
         )
         return ft.NavigationBar(
             selected_index=selected_index,
+            height=64,
             destinations=[
                 ft.NavigationBarDestination(icon=ft.Icons.HOME, label="Home"),
                 ft.NavigationBarDestination(icon=ft.Icons.TASK, label="Tasks"),
@@ -393,10 +409,16 @@ class StudyWorkspace:
                     icon=ft.Icons.SETTINGS, label="Settings"
                 ),
             ],
-            on_change=lambda event: self.page.run_task(
-                self.show, self._ROUTES[event.control.selected_index]
-            ),
+            on_change=self._on_navigation_change,
         )
+
+    def _on_navigation_change(self, event: Any) -> None:
+        selected_index = event.control.selected_index
+        if not 0 <= selected_index < len(self._NAVIGATION_ROUTES):
+            return
+        self.route = self._NAVIGATION_ROUTES[selected_index]
+        if self.auth.session is not None:
+            self._render(self.auth.session, error=self._data_error)
 
     def _build_screen(self, session: AuthSession) -> ft.Control:
         if self.route == "home":
@@ -451,10 +473,25 @@ class StudyWorkspace:
         )
 
     def _recommendation_panel(self) -> ft.Control:
+        is_guest = self.auth.session is not None and self.auth.session.is_guest
         controls: list[ft.Control] = [
-            ft.Text("AI task recommendations", size=18, weight=ft.FontWeight.BOLD)
+            ft.Row(
+                controls=[
+                    ft.Text("AI Task Recommendations", size=18, weight=ft.FontWeight.BOLD),
+                    ft.Text(
+                        "Unavailable in guest mode" if is_guest else "",
+                        color=self._secondary_text_color(),
+                        italic=True,
+                    ),
+                ],
+                spacing=8,
+            )
         ]
-        if self._recommendation_loading:
+        if is_guest:
+            controls.append(ft.Text("Unavailable in guest mode"))
+        elif self._offline_mode:
+            controls.append(ft.Text("AI features are unavailable offline."))
+        elif self._recommendation_loading:
             controls.extend(
                 [
                     ft.ProgressBar(),
@@ -519,7 +556,7 @@ class StudyWorkspace:
                         else "Get recommendations"
                     ),
                     icon=ft.Icons.AUTO_AWESOME,
-                    disabled=self._data_loading or not self._data_available,
+                    disabled=(is_guest or self._data_loading or not self._data_available),
                     on_click=lambda _: self.page.run_task(
                         self._request_recommendations
                     ),
@@ -528,13 +565,28 @@ class StudyWorkspace:
         return ft.Column(controls=controls, spacing=8)
 
     def _chat_panel(self) -> ft.Control:
+        is_guest = self.auth.session is not None and self.auth.session.is_guest
         controls: list[ft.Control] = [
-            ft.Text("Study planning assistant", size=18, weight=ft.FontWeight.BOLD),
+            ft.Row(
+                controls=[
+                    ft.Text("Study Planning Assistant", size=18, weight=ft.FontWeight.BOLD),
+                    ft.Text(
+                        "Unavailable in guest mode" if is_guest else "",
+                        color=self._secondary_text_color(),
+                        italic=True,
+                    ),
+                ],
+                spacing=8,
+            ),
             ft.Text(
                 "Ask about your current deadlines, workload, or what to study next."
             ),
         ]
-        if not self._data_available:
+        if is_guest:
+            controls.append(ft.Text("Unavailable in guest mode"))
+        elif self._offline_mode:
+            controls.append(ft.Text("AI features are unavailable offline."))
+        if not is_guest and not self._offline_mode and not self._data_available:
             controls.append(
                 ft.Text("Your study data is unavailable. Retry loading it to chat.")
             )
@@ -545,12 +597,29 @@ class StudyWorkspace:
                     "general study-planning help."
                 )
             )
-        if self._chat_loading:
+        if self._chat_loading and not is_guest and not self._offline_mode:
             controls.extend([ft.ProgressBar(), ft.Text("Thinking…")])
-        elif self._chat_error:
+        elif self._chat_error and not is_guest and not self._offline_mode:
             controls.append(ft.Text(self._chat_error, color=self._error_text_color()))
-        elif self._chat_response:
-            controls.append(ft.Text(self._chat_response, selectable=True))
+        elif self._chat_response and not is_guest and not self._offline_mode:
+            controls.append(
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Markdown(
+                                self._chat_response,
+                                selectable=True,
+                                extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                            )
+                        ],
+                        scroll=ft.ScrollMode.AUTO,
+                    ),
+                    height=360,
+                    padding=12,
+                    bgcolor=self._raised_surface_color(),
+                    border_radius=8,
+                )
+            )
         controls.extend(
             [
                 ft.TextField(
@@ -560,6 +629,8 @@ class StudyWorkspace:
                     min_lines=2,
                     max_lines=4,
                     disabled=(
+                        is_guest or self._offline_mode
+                        or
                         self._chat_loading
                         or self._data_loading
                         or not self._data_available
@@ -572,6 +643,8 @@ class StudyWorkspace:
                     content="Retry" if self._chat_error else "Send",
                     icon=ft.Icons.SEND,
                     disabled=(
+                        is_guest or self._offline_mode
+                        or
                         self._chat_loading
                         or self._data_loading
                         or not self._data_available
@@ -593,6 +666,8 @@ class StudyWorkspace:
         session = self.auth.session
         if (
             session is None
+            or session.is_guest
+            or self._offline_mode
             or self._data_loading
             or not self._data_available
             or self._recommendation_loading
@@ -625,6 +700,8 @@ class StudyWorkspace:
         session = self.auth.session
         if (
             session is None
+            or session.is_guest
+            or self._offline_mode
             or self._data_loading
             or not self._data_available
             or self._chat_loading

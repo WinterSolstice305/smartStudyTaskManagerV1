@@ -23,6 +23,9 @@ const geminiApiKey = defineSecret("GEMINI_API_KEY");
 const geminiModel = defineString("GEMINI_MODEL", {
   default: "gemini-3.8-flash",
 });
+const geminiFallbackModels = defineString("GEMINI_MODEL_FALLBACKS", {
+  default: "",
+});
 const DAILY_REQUEST_LIMIT = 30;
 
 async function consumeDailyRequest(uid) {
@@ -128,45 +131,72 @@ async function handleGeminiRequest(req, res) {
     return;
   }
 
-  const model = geminiModel.value().trim() || "gemini-3.8-flash";
+  const primaryModel = geminiModel.value().trim() || "gemini-3.8-flash";
+  const fallbackModels = geminiFallbackModels.value()
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const models = [...new Set([primaryModel, ...fallbackModels])];
+  let lastFailure;
   try {
     const client = new GoogleGenAI({ apiKey });
-    const response = await client.models.generateContent({
-      model,
-      contents: input.prompt,
-      config: {
-        systemInstruction: input.systemInstruction,
-        maxOutputTokens: input.maxOutputTokens,
-        temperature: 0.2,
-        ...(input.responseSchema
-          ? {
-              responseMimeType: "application/json",
-              responseSchema: input.responseSchema,
-            }
-          : {}),
-      },
-    });
-    if (typeof response.text !== "string" || !response.text.trim()) {
-      logger.warn(
-        "Gemini request failed: category=invalid_response status=200 model=%s",
-        model,
-      );
-      res.status(502).json({
-        error: {
-          code: "GEMINI_UNAVAILABLE",
-          message: "Gemini returned an empty response. Please retry.",
-        },
-      });
-      return;
+    for (const model of models) {
+      try {
+        const response = await client.models.generateContent({
+          model,
+          contents: input.prompt,
+          config: {
+            systemInstruction: input.systemInstruction,
+            maxOutputTokens: input.maxOutputTokens,
+            temperature: 0.2,
+            ...(input.responseSchema
+              ? {
+                  responseMimeType: "application/json",
+                  responseSchema: input.responseSchema,
+                }
+              : {}),
+          },
+        });
+        if (typeof response.text === "string" && response.text.trim()) {
+          res.status(200).json({ text: response.text });
+          return;
+        }
+        lastFailure = new Error("Gemini returned an empty response.");
+      } catch (error) {
+        lastFailure = error;
+        logger.warn("Gemini model failed; trying the next configured model: model=%s", model);
+        const failureCategory = classifyGeminiError(error).category;
+        if (
+          failureCategory === "network_failure" ||
+          failureCategory === "network_timeout"
+        ) {
+          break;
+        }
+      }
     }
-    res.status(200).json({ text: response.text });
+    const failure = lastFailure
+      ? classifyGeminiError(lastFailure)
+      : {
+          status: 503,
+          code: "GEMINI_UNAVAILABLE",
+          message: "All configured Gemini models are unavailable.",
+        };
+    logger.warn(
+      "Gemini request failed: category=%s status=%s models=%s",
+      failure.category,
+      failure.status,
+      models.join(","),
+    );
+    res.status(failure.status).json({
+      error: { code: failure.code, message: failure.message },
+    });
   } catch (error) {
     const failure = classifyGeminiError(error);
     logger.warn(
-      "Gemini request failed: category=%s status=%s model=%s",
+      "Gemini request failed: category=%s status=%s models=%s",
       failure.category,
       Number(error?.status ?? error?.code) || "network",
-      geminiModel.value(),
+      models.join(","),
     );
     res.status(failure.status).json({
       error: { code: failure.code, message: failure.message },

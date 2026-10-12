@@ -3,7 +3,7 @@
 const MAX_PROMPT_LENGTH = 40_000;
 const MAX_SYSTEM_INSTRUCTION_LENGTH = 4_000;
 const MAX_SCHEMA_LENGTH = 10_000;
-const MAX_OUTPUT_TOKENS = 1_500;
+const MAX_OUTPUT_TOKENS = 4_000;
 
 class RequestError extends Error {
   constructor(status, code, message) {

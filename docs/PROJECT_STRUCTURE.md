@@ -11,6 +11,11 @@ This repository is a compact Python/Flet application. The significant runtime co
 ├── README.md
 ├── firebase.json
 ├── firestore.rules
+├── functions/
+│   ├── index.js
+│   ├── package.json
+│   ├── src/gemini.js
+│   └── test/gemini.test.js
 ├── main.py
 ├── package.json
 ├── pyproject.toml
@@ -28,6 +33,7 @@ This repository is a compact Python/Flet application. The significant runtime co
 │   │   ├── firebase_auth.py
 │   │   ├── firestore.py
 │   │   ├── gemini.py
+│   │   ├── study_cache.py
 │   │   ├── subject_service.py
 │   │   └── task_service.py
 │   └── ui/
@@ -36,6 +42,7 @@ This repository is a compact Python/Flet application. The significant runtime co
 │       ├── login.py
 │       ├── register.py
 │       ├── task_views.py
+│       ├── theme.py
 │       └── workspace.py
 ├── tests/
 │   ├── __init__.py
@@ -74,13 +81,15 @@ Declares the Python project metadata and an upper-level requirement of `>=3.14`.
 
 The Python dependency manifest used for standard installation. It includes:
 
-- `flet==1.0.3`
+- `flet>=1.0.4`
 - `google-genai>=1.0.0,<3.0.0`
 - `python-dotenv>=1.0.0,<2.0.0`
 
 ### `firebase.json`
 
-Firebase configuration file that points at `firestore.rules` and defines the local Firestore emulator port.
+Firebase configuration file that points at `firestore.rules`, declares the
+Node.js 20 Cloud Functions source directory, and defines local Functions and
+Firestore emulator ports.
 
 ### `firestore.rules`
 
@@ -133,7 +142,11 @@ Defines `ModelValidationError` and `DocumentNotFoundError` used across the app.
 
 Wraps Firebase Identity Toolkit calls for sign up and login. It also translates common Firebase API failures into readable user messages.
 
-This is the only authentication implementation in the app and is used by the UI and Firestore service.
+It saves only the email and refresh token at
+`~/.smart-study-task-manager/session.json`, then uses Firebase Secure Token to
+restore a session on startup. Logout removes that file. This is the only
+authentication implementation in the app and is used by the UI and Firestore
+service.
 
 ### `app/services/firestore.py`
 
@@ -158,7 +171,17 @@ Implements the AI planner functionality. It contains:
 - Gemini request formatting and error handling
 - local deadline sorting utilities
 
-This is read-only: it takes the task snapshot and returns recommendations or an answer without mutating Firestore data.
+By default it sends authenticated requests to `generateGemini` in Firebase
+Cloud Functions. `GEMINI_BACKEND_URL=direct` is a local-development escape
+hatch that calls Google directly with `GEMINI_API_KEY`. Both modes are
+read-only with respect to the client task data.
+
+### `app/services/study_cache.py`
+
+Maintains a best-effort per-user snapshot at
+`~/.smart-study-task-manager/study-cache.json`. The workspace can render this
+snapshot during its initial Firestore refresh; it is not an offline sync or
+write queue.
 
 ## `app/ui/`
 
@@ -180,6 +203,25 @@ This is the most important file in `app/ui` and is the central orchestration lay
 
 Contains task filtering, sorting, and calendar helpers used by the workspace.
 
+### `app/ui/theme.py`
+
+Defines the light/dark palettes and persists the selected `dark_mode` value at
+`~/.smart-study-task-manager/preferences.json`.
+
+## `functions/`
+
+### `functions/index.js`
+
+Exports the HTTPS `generateGemini` Cloud Function in `us-central1`. It verifies
+the caller's Firebase ID token, validates the request, reads `GEMINI_API_KEY`
+from a Firebase secret, calls Gemini, and enforces a 30-request-per-user UTC
+day limit using the Admin SDK.
+
+### `functions/src/gemini.js`
+
+Contains request-size validation and Gemini error classification used by the
+function. `functions/test/gemini.test.js` exercises these helpers.
+
 ### `app/ui/home.py`
 
 A simple logged-in page that is not the primary app route in the current implementation. It exists as a helper/screen, but the main application flow uses `StudyWorkspace` instead.
@@ -195,6 +237,8 @@ The repo contains Python unit tests and a Firestore security rules test.
 - `test_gemini.py` verifies AI prompt context, rate-limit handling, and read-only behavior.
 - `test_models_services.py` verifies `Subject` and `Task` validation and CRUD logic.
 - `test_task_views.py` validates sorting/filtering utilities.
+- `test_workspace_ui.py` validates workspace loading, cache, calendar, and
+  persisted-appearance behavior.
 
 ### `firestore_rules.test.mjs`
 
@@ -219,7 +263,10 @@ The following are present but are not the primary runtime flow for the app as im
 
 ## Relevant current limitations
 
-- There is no backend service or persisted local state beyond Firestore + Firebase auth.
-- The app keeps auth state in memory only; reloading the app loses session state.
+- The Cloud Function's usage counter is an operational record, not application
+  data, and requires the function service account to access Firestore.
+- Local session, cache, and appearance files are best-effort; a device with
+  access to the user's profile may access their cached study data or refresh
+  token.
 - The project contains an actual Firebase API key default in `app/config.py` and should not be used in production.
 - Android packaging is present as a Flutter/Flet build layout, but there is no validated end-to-end APK build command checked in by the repo itself.
