@@ -154,6 +154,7 @@ activemq-data/
 .env.*
 !.env.example
 .envrc
+functions/.secret.local
 **/*firebase-adminsdk*.json
 .venv
 env/
@@ -221,3 +222,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+firebase-tools-instant-win
