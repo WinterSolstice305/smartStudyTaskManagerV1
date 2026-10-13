@@ -8,10 +8,11 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 from app.services.firebase_auth import FirebaseAuthService
 from app.services.local_store import LocalStore
+from app.services.storage import storage_path, storage_root
 
 
 logger = logging.getLogger(__name__)
@@ -34,23 +35,56 @@ class FirestoreDocument:
 class FirestoreService:
     _API_URL = "https://firestore.googleapis.com/v1"
 
-    def __init__(self, auth: FirebaseAuthService, project_id: str) -> None:
+    def __init__(
+        self,
+        auth: FirebaseAuthService,
+        project_id: str,
+        diagnostic_callback: Callable[[str, str, str], None] | None = None,
+    ) -> None:
         self._auth = auth
         self._project_id = project_id.strip()
         if not self._project_id or "/" in self._project_id:
             raise ValueError("A valid Firebase project ID is required.")
         self._local_store = LocalStore()
         self._offline_store = LocalStore(
-            LocalStore()._path.parent / "authenticated-offline-data.json"
+            storage_path("authenticated-offline-data.json")
         )
-        self._queue_path = LocalStore()._path.parent / "sync-queue.json"
+        self._queue_path = storage_path("sync-queue.json")
         self.offline = False
+        self._diagnostic_callback = diagnostic_callback
+        self._diagnostic(
+            "application storage",
+            "success",
+            f"Resolved app-private storage root: {storage_root()}",
+        )
+
+    def _diagnostic(self, operation: str, status: str, details: str) -> None:
+        if self._diagnostic_callback is None:
+            return
+        try:
+            self._diagnostic_callback(operation, status, details)
+        except Exception:
+            logger.debug("Startup diagnostic callback failed", exc_info=True)
 
     def seed_offline_snapshot(self, uid: str, collection: str, documents: list[FirestoreDocument]) -> None:
-        self._offline_store.replace(
-            self._offline_collection(uid, collection),
-            {document.document_id: document.data for document in documents},
-        )
+        try:
+            self._offline_store.replace(
+                self._offline_collection(uid, collection),
+                {document.document_id: document.data for document in documents},
+            )
+        except OSError as error:
+            # A cache seed is best effort. It must never prevent the already
+            # loaded Firestore data from being displayed.
+            logger.warning(
+                "Could not seed the authenticated offline mirror for %s: %s",
+                collection,
+                error,
+            )
+            self._diagnostic(
+                f"offline mirror seed ({collection})",
+                "warning",
+                f"{type(error).__name__}: local mirror unavailable; existing Firestore data remains active.",
+            )
 
     async def create_document(
         self,
@@ -192,7 +226,26 @@ class FirestoreService:
                     if not self._is_offline_error(error):
                         raise
                     self.offline = True
-                    return self._offline_store.list(self._offline_collection(session.uid, collection))
+                    try:
+                        documents = self._offline_store.list(
+                            self._offline_collection(session.uid, collection)
+                        )
+                    except OSError as storage_error:
+                        self._diagnostic(
+                            f"offline {collection} retrieval",
+                            "error",
+                            f"{type(storage_error).__name__}: authenticated offline mirror is not readable.",
+                        )
+                        raise FirestoreError(
+                            "Firestore is unavailable and the authenticated offline mirror "
+                            "cannot be read. Check app storage permissions, then retry."
+                        ) from storage_error
+                    self._diagnostic(
+                        f"{collection} data source",
+                        "warning",
+                        f"Using the authenticated offline mirror after Firestore failure: {type(error).__name__}.",
+                    )
+                    return documents
             except FirestoreError:
                 logger.warning(
                     "Firestore could not load collection %s after %.2f seconds.",
@@ -216,9 +269,34 @@ class FirestoreService:
                     len(documents),
                     perf_counter() - started_at,
                 )
-                self._offline_store.replace(
-                    self._offline_collection(session.uid, collection),
-                    {document.document_id: document.data for document in documents},
+                try:
+                    self._offline_store.replace(
+                        self._offline_collection(session.uid, collection),
+                        {document.document_id: document.data for document in documents},
+                    )
+                    self._diagnostic(
+                        f"{collection} offline mirror",
+                        "success",
+                        "Authenticated Firestore data was mirrored locally.",
+                    )
+                except OSError as error:
+                    # Remote retrieval is authoritative while online. A
+                    # local-mirror failure must not turn a successful remote
+                    # response into a task/subject retrieval failure.
+                    logger.warning(
+                        "Could not update the authenticated offline mirror for %s: %s",
+                        collection,
+                        error,
+                    )
+                    self._diagnostic(
+                        f"{collection} offline mirror",
+                        "warning",
+                        f"{type(error).__name__}: local mirror unavailable; using Firestore data directly.",
+                    )
+                self._diagnostic(
+                    f"{collection} data source",
+                    "success",
+                    f"Loaded {len(documents)} documents from Firestore.",
                 )
                 return documents
 

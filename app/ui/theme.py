@@ -5,6 +5,8 @@ from pathlib import Path
 
 import flet as ft
 
+from app.services.storage import ensure_storage_root, storage_path
+
 
 logger = logging.getLogger(__name__)
 
@@ -62,24 +64,85 @@ FONT_SCALES = {"small": 0.9, "default": 1.0, "large": 1.15}
 
 def apply_theme(page: ft.Page, dark_mode: bool, font_size: str = "default") -> None:
     palette = colors_for(dark_mode)
-    page.theme = ft.Theme(color_scheme_seed=LIGHT.primary, use_material3=True)
-    page.dark_theme = ft.Theme(color_scheme_seed=DARK.primary, use_material3=True)
-    page.theme_mode = ft.ThemeMode.DARK if dark_mode else ft.ThemeMode.LIGHT
-    page.theme.text_theme = ft.TextTheme(
-        body_large=ft.TextStyle(size=16 * FONT_SCALES.get(font_size, 1.0)),
-        body_medium=ft.TextStyle(size=14 * FONT_SCALES.get(font_size, 1.0)),
-        body_small=ft.TextStyle(size=12 * FONT_SCALES.get(font_size, 1.0)),
-        title_large=ft.TextStyle(size=22 * FONT_SCALES.get(font_size, 1.0)),
-        title_medium=ft.TextStyle(size=18 * FONT_SCALES.get(font_size, 1.0)),
-        title_small=ft.TextStyle(size=16 * FONT_SCALES.get(font_size, 1.0)),
-        headline_small=ft.TextStyle(size=24 * FONT_SCALES.get(font_size, 1.0)),
+    scale = FONT_SCALES.get(font_size, 1.0)
+    text_theme = ft.TextTheme(
+        body_large=ft.TextStyle(size=16 * scale, color=palette.text),
+        body_medium=ft.TextStyle(size=14 * scale, color=palette.text),
+        body_small=ft.TextStyle(size=12 * scale, color=palette.secondary_text),
+        title_large=ft.TextStyle(size=22 * scale, color=palette.text),
+        title_medium=ft.TextStyle(size=18 * scale, color=palette.text),
+        title_small=ft.TextStyle(size=16 * scale, color=palette.text),
+        headline_small=ft.TextStyle(size=24 * scale, color=palette.text),
     )
-    page.dark_theme.text_theme = page.theme.text_theme
+    color_scheme = ft.ColorScheme(
+        primary=palette.primary,
+        on_primary=palette.on_primary,
+        primary_container=palette.accent_surface,
+        on_primary_container=palette.text,
+        secondary=palette.accent,
+        on_secondary=palette.on_primary,
+        surface=palette.background,
+        on_surface=palette.text,
+        on_surface_variant=palette.secondary_text,
+        outline=palette.border,
+        outline_variant=palette.border,
+        error=palette.error,
+        on_error=palette.on_primary,
+    )
+    page.theme = ft.Theme(
+        color_scheme=color_scheme,
+        use_material3=True,
+        text_theme=text_theme,
+        scaffold_bgcolor=palette.background,
+        canvas_color=palette.background,
+        card_bgcolor=palette.elevated_surface,
+        divider_color=palette.border,
+        hint_color=palette.secondary_text,
+        unselected_control_color=palette.secondary_text,
+        disabled_color=palette.secondary_text,
+        icon_theme=ft.IconTheme(color=palette.text),
+    )
+    page.dark_theme = page.theme if dark_mode else ft.Theme(
+        color_scheme=ft.ColorScheme(
+            primary=DARK.primary,
+            on_primary=DARK.on_primary,
+            primary_container=DARK.accent_surface,
+            on_primary_container=DARK.text,
+            secondary=DARK.accent,
+            on_secondary=DARK.on_primary,
+            surface=DARK.background,
+            on_surface=DARK.text,
+            on_surface_variant=DARK.secondary_text,
+            outline=DARK.border,
+            outline_variant=DARK.border,
+            error=DARK.error,
+            on_error=DARK.on_primary,
+        ),
+        use_material3=True,
+        text_theme=ft.TextTheme(
+            body_large=ft.TextStyle(size=16 * scale, color=DARK.text),
+            body_medium=ft.TextStyle(size=14 * scale, color=DARK.text),
+            body_small=ft.TextStyle(size=12 * scale, color=DARK.secondary_text),
+            title_large=ft.TextStyle(size=22 * scale, color=DARK.text),
+            title_medium=ft.TextStyle(size=18 * scale, color=DARK.text),
+            title_small=ft.TextStyle(size=16 * scale, color=DARK.text),
+            headline_small=ft.TextStyle(size=24 * scale, color=DARK.text),
+        ),
+        scaffold_bgcolor=DARK.background,
+        canvas_color=DARK.background,
+        card_bgcolor=DARK.elevated_surface,
+        divider_color=DARK.border,
+        hint_color=DARK.secondary_text,
+        unselected_control_color=DARK.secondary_text,
+        disabled_color=DARK.secondary_text,
+        icon_theme=ft.IconTheme(color=DARK.text),
+    )
+    page.theme_mode = ft.ThemeMode.DARK if dark_mode else ft.ThemeMode.LIGHT
     page.bgcolor = palette.background
 
 
 def _preferences_path() -> Path:
-    return Path.home() / ".smart-study-task-manager" / "preferences.json"
+    return storage_path("preferences.json")
 
 
 def load_dark_mode() -> bool:
@@ -115,7 +178,7 @@ def save_appearance(dark_mode: bool, font_size: str) -> None:
     if font_size not in FONT_SCALES:
         font_size = "default"
     path = _preferences_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_storage_root()
     temporary_path = path.with_suffix(".tmp")
     with temporary_path.open("w", encoding="utf-8") as preferences_file:
         json.dump({"dark_mode": dark_mode, "font_size": font_size}, preferences_file)

@@ -12,7 +12,7 @@ import flet as ft
 from app.services.firestore import FirestoreError
 from app.services.firebase_auth import AuthSession, FirebaseAuthService
 from app.services.study_cache import StudyCache
-from app.ui.theme import load_dark_mode, save_dark_mode
+from app.ui.theme import DARK, LIGHT, apply_theme, load_dark_mode, save_dark_mode
 from app.ui.workspace import StudyWorkspace
 
 
@@ -59,6 +59,85 @@ class WorkspaceUiTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._cache_directory.cleanup()
+
+    @staticmethod
+    def _contrast_ratio(foreground: str, background: str) -> float:
+        def channel(value: str) -> float:
+            value = int(value, 16) / 255
+            return value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4
+
+        def luminance(color: str) -> float:
+            color = color.removeprefix("#")
+            return (
+                0.2126 * channel(color[0:2])
+                + 0.7152 * channel(color[2:4])
+                + 0.0722 * channel(color[4:6])
+            )
+
+        lighter = max(luminance(foreground), luminance(background))
+        darker = min(luminance(foreground), luminance(background))
+        return (lighter + 0.05) / (darker + 0.05)
+
+    def test_light_and_dark_palettes_have_contrast_for_primary_text(self) -> None:
+        for palette in (LIGHT, DARK):
+            self.assertGreaterEqual(
+                self._contrast_ratio(palette.text, palette.background), 7.0
+            )
+            self.assertGreaterEqual(
+                self._contrast_ratio(palette.secondary_text, palette.surface), 4.5
+            )
+            self.assertGreaterEqual(
+                self._contrast_ratio(palette.on_primary, palette.primary), 4.5
+            )
+
+    def test_theme_switching_updates_explicit_color_schemes(self) -> None:
+        apply_theme(self.page, False)
+        self.assertEqual(self.page.theme_mode, ft.ThemeMode.LIGHT)
+        self.assertEqual(self.page.theme.color_scheme.on_surface, LIGHT.text)
+        self.assertEqual(self.page.theme.color_scheme.outline, LIGHT.border)
+
+        apply_theme(self.page, True)
+        self.assertEqual(self.page.theme_mode, ft.ThemeMode.DARK)
+        self.assertEqual(self.page.theme.color_scheme.on_surface, DARK.text)
+        self.assertEqual(self.page.theme.color_scheme.outline, DARK.border)
+
+    def test_major_screens_build_in_both_theme_modes(self) -> None:
+        session = AuthSession(
+            uid="user",
+            email="student@example.com",
+            id_token="token",
+            refresh_token="refresh-token",
+            expires_in="3600",
+        )
+        for dark_mode in (False, True):
+            self.workspace.dark_mode = dark_mode
+            apply_theme(self.page, dark_mode)
+            for route in ("home", "tasks", "calendar", "settings", "profile"):
+                self.workspace.route = route
+                screen = self.workspace._build_screen(session)
+                self.assertIsInstance(screen, ft.Control)
+
+    def test_navigation_bar_is_safe_area_aware_and_centered(self) -> None:
+        navigation = self.workspace._navigation_bar()
+        self.assertEqual(navigation.height, 80)
+        self.assertEqual(
+            navigation.label_behavior, ft.NavigationBarLabelBehavior.ALWAYS_SHOW
+        )
+        self.assertEqual(navigation.label_padding, ft.Padding(0, 2, 0, 6))
+        self.assertEqual(navigation.bgcolor, LIGHT.surface)
+
+        session = AuthSession(
+            uid="user",
+            email="student@example.com",
+            id_token="token",
+            refresh_token="refresh-token",
+            expires_in="3600",
+        )
+        self.workspace._render(session)
+        root = self.page.controls[0]
+        self.assertIsInstance(root, ft.Column)
+        if isinstance(root, ft.Column):
+            self.assertIsInstance(root.controls[-1], ft.SafeArea)
 
     def test_filters_start_collapsed_and_can_be_toggled_without_resetting(self) -> None:
         screen = self.workspace._task_screen()

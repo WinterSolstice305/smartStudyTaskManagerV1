@@ -142,8 +142,8 @@ Defines `ModelValidationError` and `DocumentNotFoundError` used across the app.
 
 Wraps Firebase Identity Toolkit calls for sign up and login. It also translates common Firebase API failures into readable user messages.
 
-It saves only the email and refresh token at
-`~/.smart-study-task-manager/session.json`, then uses Firebase Secure Token to
+It saves only the email and refresh token at the platform-private storage path
+`storage_root()/session.json`, then uses Firebase Secure Token to
 restore a session on startup. Logout removes that file. This is the only
 authentication implementation in the app and is used by the UI and Firestore
 service.
@@ -179,7 +179,9 @@ read-only with respect to the client task data.
 ### `app/services/study_cache.py`
 
 Maintains a best-effort per-user snapshot at
-`~/.smart-study-task-manager/study-cache.json`. The workspace can render this
+`storage_root()/study-cache.json`. On Android, `storage_root()` is based on
+Flet's `FLET_APP_STORAGE_DATA` app-private directory; desktop retains the
+existing home-directory location. The workspace can render this
 snapshot during its initial Firestore refresh; it is not an offline sync or
 write queue.
 
@@ -206,7 +208,13 @@ Contains task filtering, sorting, and calendar helpers used by the workspace.
 ### `app/ui/theme.py`
 
 Defines the light/dark palettes and persists the selected `dark_mode` value at
-`~/.smart-study-task-manager/preferences.json`.
+`storage_root()/preferences.json`.
+
+### `app/services/storage.py`
+
+Resolves persistent local storage through Flet's app-private Android storage
+environment, with a desktop home-directory fallback. It centralizes directory
+creation and reports permission failures without exposing credentials.
 
 ## `functions/`
 

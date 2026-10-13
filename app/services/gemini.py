@@ -267,8 +267,8 @@ async def _generate_text(
             if "Could not reach" in str(error) or "took too long" in str(error):
                 break
     raise GeminiServiceError(
-        "Gemini AI is currently unavailable. All configured Gemini models failed; "
-        "check the model configuration, quota, and network connection."
+        "Gemini AI is currently unavailable after all configured models failed: "
+        f"{last_error or 'check the model configuration, quota, and network connection.'}"
     ) from last_error
 
 

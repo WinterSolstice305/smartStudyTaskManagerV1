@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -26,6 +27,12 @@ def main(page: ft.Page) -> None:
         FIREBASE_PROJECT_ID,
         on_unauthenticated=lambda: show_login(),
     )
+    auth.set_diagnostic_callback(workspace.record_startup_event)
+    workspace.record_startup_event(
+        "application startup",
+        "success",
+        "Flet page, authentication service, and workspace services initialized.",
+    )
     logger.info("Application startup: workspace services initialized.")
 
     def show_login() -> None:
@@ -45,10 +52,38 @@ def main(page: ft.Page) -> None:
         page.run_task(workspace.show, "home")
 
     async def restore_or_show_login() -> None:
-        restored = await auth.restore_session()
-        if restored is None:
+        workspace.record_startup_event(
+            "startup session restoration", "started", "Beginning persisted-session restoration."
+        )
+        try:
+            restored = await asyncio.wait_for(auth.restore_session(), timeout=20)
+        except asyncio.TimeoutError as error:
+            workspace.record_startup_event(
+                "startup session restoration",
+                "error",
+                f"{type(error).__name__}: Firebase session restoration exceeded 20 seconds.",
+            )
             show_login()
             return
+        except Exception as error:
+            workspace.record_startup_event(
+                "startup session restoration",
+                "error",
+                f"{type(error).__name__}: Could not restore the saved session.",
+            )
+            show_login()
+            return
+        if restored is None:
+            workspace.record_startup_event(
+                "startup session restoration",
+                "warning",
+                "No authenticated session was restored; showing the sign-in screen.",
+            )
+            show_login()
+            return
+        workspace.record_startup_event(
+            "startup session restoration", "success", "Authenticated session is ready."
+        )
         logger.info("Application startup: restored saved Firebase session.")
         show_home()
 

@@ -6,10 +6,11 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.services.local_store import LocalStore
 from app.services.study_cache import StudyCache
+from app.services.storage import storage_path
 
 
 class FirebaseAuthError(Exception):
@@ -33,11 +34,24 @@ class FirebaseAuthService:
     def __init__(self, api_key: str, session_path: Path | None = None) -> None:
         self._api_key = api_key.strip()
         self._session: AuthSession | None = None
-        self._session_path = session_path or (
-            Path.home() / ".smart-study-task-manager" / "session.json"
-        )
+        self._session_path = session_path or storage_path("session.json")
         self._guest_store = LocalStore()
         self._study_cache = StudyCache()
+        self._diagnostic_callback: Callable[[str, str, str], None] | None = None
+
+    def set_diagnostic_callback(
+        self, callback: Callable[[str, str, str], None] | None
+    ) -> None:
+        self._diagnostic_callback = callback
+
+    def _diagnostic(self, operation: str, status: str, details: str) -> None:
+        if self._diagnostic_callback is None:
+            return
+        try:
+            self._diagnostic_callback(operation, status, details)
+        except Exception:
+            # Diagnostics must never prevent authentication from completing.
+            pass
 
     @property
     def session(self) -> AuthSession | None:
@@ -65,27 +79,36 @@ class FirebaseAuthService:
         This never authenticates a new user offline. It only restores a session
         that was previously authenticated and persisted on this device.
         """
+        self._diagnostic("session restoration", "started", "Reading the locally persisted session.")
         try:
             saved = json.loads(self._session_path.read_text(encoding="utf-8"))
             refresh_token = saved["refresh_token"]
             email = saved.get("email", "")
-        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        except FileNotFoundError:
+            self._diagnostic("session restoration", "warning", "No saved session was found; interactive sign-in is required.")
+            return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+            self._diagnostic("session restoration", "error", self._safe_error(error, "The saved session could not be read."))
             return None
         if not isinstance(refresh_token, str) or not refresh_token:
+            self._diagnostic("session restoration", "error", "The saved session has no usable refresh token.")
             return None
+        self._diagnostic("Firebase session refresh", "started", "Checking the saved session with Firebase.")
         try:
             response = await asyncio.to_thread(self._refresh, refresh_token)
             session = AuthSession(
                 uid=response["user_id"], email=email, id_token=response["id_token"],
                 refresh_token=response["refresh_token"], expires_in=response["expires_in"],
             )
-        except (FirebaseAuthError, KeyError, TypeError):
+        except (FirebaseAuthError, KeyError, TypeError) as error:
+            self._diagnostic("Firebase session refresh", "warning", self._safe_error(error, "Firebase refresh failed; checking for an offline session."))
             # A refresh needs connectivity. If the previously issued ID token
             # is still valid, it can authorize only locally cached data.
             id_token = saved.get("id_token", "")
             uid = saved.get("uid", "")
             expires_at = saved.get("expires_at", 0)
             if not isinstance(id_token, str) or not id_token or not isinstance(uid, str) or not uid:
+                self._diagnostic("offline session restoration", "error", "No locally persisted authenticated token is available.")
                 return None
             session = AuthSession(
                 uid=uid,
@@ -96,11 +119,13 @@ class FirebaseAuthService:
                 if isinstance(expires_at, (int, float)) else "0",
             )
             self._session = session
+            self._diagnostic("offline session restoration", "success", "Restored the previously authenticated session without network access.")
             return session
         self._session = session
         self._guest_store.clear()
         self._study_cache.clear("guest")
         self._save_session(session)
+        self._diagnostic("Firebase session refresh", "success", "Authenticated session restored and refreshed.")
         return session
 
     def logout(self) -> None:
@@ -115,7 +140,12 @@ class FirebaseAuthService:
                 "Firebase is not configured. Set FIREBASE_API_KEY in the app configuration."
             )
 
-        response = await asyncio.to_thread(self._post_json, operation, payload)
+        self._diagnostic(f"Firebase {operation}", "started", "Authenticating the account.")
+        try:
+            response = await asyncio.to_thread(self._post_json, operation, payload)
+        except FirebaseAuthError as error:
+            self._diagnostic(f"Firebase {operation}", "error", self._safe_error(error, "Firebase authentication failed."))
+            raise
         try:
             session = AuthSession(
                 uid=response["localId"],
@@ -133,7 +163,15 @@ class FirebaseAuthService:
         self._guest_store.clear()
         self._study_cache.clear("guest")
         self._save_session(session)
+        self._diagnostic(f"Firebase {operation}", "success", "Authentication completed.")
         return session
+
+    @staticmethod
+    def _safe_error(error: Exception, fallback: str) -> str:
+        message = str(error).strip() or fallback
+        for secret_name in ("FIREBASE_API_KEY", "id_token", "refresh_token"):
+            message = message.replace(secret_name, "[redacted]")
+        return f"{type(error).__name__}: {message}"
 
     def _refresh(self, refresh_token: str) -> dict[str, Any]:
         url = f"{self._TOKEN_URL}?key={urllib.parse.quote(self._api_key, safe='')}"

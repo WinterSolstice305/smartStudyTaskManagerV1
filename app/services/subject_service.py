@@ -85,13 +85,42 @@ class SubjectService:
         )
         return updated
 
-    async def delete_subject(self, subject_id: str) -> None:
+    async def delete_subject(
+        self, subject_id: str, *, delete_tasks: bool = False
+    ) -> None:
+        """Delete a subject, optionally deleting the tasks assigned to it.
+
+        The default remains deliberately conservative for callers that do not
+        have an explicit user confirmation for task deletion.
+        """
         existing = await self.get_subject(subject_id)
         if existing is None:
             raise DocumentNotFoundError(f"Subject '{subject_id}' does not exist.")
         tasks = await self._firestore.list_documents("tasks")
-        if any(task.data.get("subject_id") == subject_id for task in tasks):
+        related_tasks = [
+            task for task in tasks if task.data.get("subject_id") == subject_id
+        ]
+        if related_tasks and not delete_tasks:
             raise SubjectInUseError(
                 f"Subject '{subject_id}' is assigned to one or more tasks."
             )
-        await self._firestore.delete_document(self._COLLECTION, subject_id)
+        deleted_tasks = []
+        try:
+            for task in related_tasks:
+                await self._firestore.delete_document("tasks", task.document_id)
+                deleted_tasks.append(task)
+            await self._firestore.delete_document(self._COLLECTION, subject_id)
+        except Exception:
+            # Firestore's REST surface does not expose a transaction spanning
+            # two top-level collections. Restore any task documents already
+            # removed if the remaining deletes fail, including subject delete.
+            for task in deleted_tasks:
+                try:
+                    await self._firestore.create_document(
+                        "tasks", task.data, document_id=task.document_id
+                    )
+                except Exception:
+                    # Preserve the original failure; the caller still receives
+                    # an error instead of being told the deletion succeeded.
+                    pass
+            raise

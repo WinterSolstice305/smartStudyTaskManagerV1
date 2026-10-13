@@ -1,14 +1,20 @@
 """Small device-local document store used by offline guest mode."""
 
 import json
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
 
+from app.services.storage import ensure_storage_root, storage_path
+
+
+logger = logging.getLogger(__name__)
+
 
 class LocalStore:
     def __init__(self, path: Path | None = None) -> None:
-        self._path = path or Path.home() / ".smart-study-task-manager" / "guest-data.json"
+        self._path = path or storage_path("guest-data.json")
 
     def create(self, collection: str, data: dict[str, Any], document_id: str | None = None) -> str:
         payload = self._read()
@@ -64,12 +70,20 @@ class LocalStore:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
                 return payload
-        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        except FileNotFoundError:
             pass
+        except PermissionError as error:
+            logger.error("Local store read permission denied for %s", self._path)
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            logger.warning("Local store read failed for %s: %s", self._path, error)
         return {}
 
     def _write(self, payload: dict[str, Any]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if self._path.parent == storage_path("guest-data.json").parent:
+            ensure_storage_root()
+        else:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload), encoding="utf-8")
         temporary.replace(self._path)

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time as time_module
 from calendar import month_name, monthrange
 from datetime import date, datetime, time, timezone
@@ -23,6 +24,7 @@ from app.services.gemini import (
     generate_task_recommendations,
 )
 from app.services.subject_service import SubjectService
+from app.services.subject_service import SubjectInUseError
 from app.services.study_cache import StudyCache
 from app.services.task_service import TaskService
 from app.ui.task_views import filter_tasks, month_grid, sort_tasks, tasks_for_date
@@ -38,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 class StudyWorkspace:
+    _STARTUP_DATA_TIMEOUT_SECONDS = 35
     _ROUTES = ["home", "tasks", "calendar", "settings"]
     _NAVIGATION_ROUTES = ["home", "tasks", "calendar", "settings"]
     _PRIORITIES = ["high", "medium", "low"]
@@ -59,9 +62,24 @@ class StudyWorkspace:
     ) -> None:
         self.page = page
         self.auth = auth
-        self.firestore = FirestoreService(auth, project_id)
+        self._startup_started_at = time_module.perf_counter()
+        self._startup_log: list[tuple[str, str]] = []
+        self._diagnostic_view: ft.ListView | None = None
+        self.record_startup_event(
+            "workspace initialization", "started", "Creating Firebase and local data services."
+        )
+        self.firestore = FirestoreService(
+            auth,
+            project_id,
+            diagnostic_callback=self.record_startup_event,
+        )
         self.subjects = SubjectService(self.firestore)
         self.tasks = TaskService(self.firestore, self.subjects)
+        self.record_startup_event(
+            "Firebase/Firestore service initialization",
+            "success",
+            "Firestore client and local cache services are ready.",
+        )
         self._study_cache = StudyCache()
         self.on_unauthenticated = on_unauthenticated
         self.route = "home"
@@ -88,6 +106,7 @@ class StudyWorkspace:
         self.dark_mode = load_dark_mode()
         self._load_request_id = 0
         self._loading_status: ft.Text | None = None
+        self._subject_delete_in_progress: set[str] = set()
         self._filters_expanded = False
         self._task_filter_values = {
             "subject_id": "",
@@ -97,6 +116,45 @@ class StudyWorkspace:
             "ordering": "deadline_asc",
         }
         apply_theme(page, self.dark_mode)
+
+    def record_startup_event(
+        self, operation: str, status: str, details: str
+    ) -> None:
+        """Append a user-safe startup event and refresh the visible diagnostic log."""
+        elapsed = time_module.perf_counter() - self._startup_started_at
+        timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
+        safe_details = self._safe_diagnostic_text(details)
+        line = f"[{timestamp}] +{elapsed:06.2f}s  {status.upper():7}  {operation}: {safe_details}"
+        self._startup_log.append((line, status))
+        if len(self._startup_log) > 100:
+            self._startup_log = self._startup_log[-100:]
+        if self._diagnostic_view is not None:
+            self._diagnostic_view.controls = self._diagnostic_controls()
+            try:
+                self.page.update()
+            except Exception:
+                # A diagnostic refresh must not interrupt the startup operation.
+                pass
+
+    def _diagnostic_controls(self) -> list[ft.Control]:
+        palette = colors_for(self.dark_mode)
+        colors = {
+            "success": palette.accent,
+            "warning": "#B45309" if not self.dark_mode else "#FBBF24",
+            "error": palette.error,
+            "started": palette.secondary_text,
+            "info": palette.secondary_text,
+        }
+        return [
+            ft.Text(line, size=11, color=colors.get(status, palette.text), selectable=True)
+            for line, status in self._startup_log
+        ]
+
+    @staticmethod
+    def _safe_diagnostic_text(details: str) -> str:
+        text = str(details).strip()
+        text = re.sub(r"(?i)(api[_ -]?key|id[_ -]?token|refresh[_ -]?token|password)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+        return text[:500]
 
     async def show(
         self,
@@ -142,6 +200,11 @@ class StudyWorkspace:
             self.task_cache, self.subject_cache = cached_data
             self._data_available = True
             self._offline_mode = False
+            self.record_startup_event(
+                "local study-cache load",
+                "success",
+                f"Loaded {len(self.task_cache)} cached tasks and {len(self.subject_cache)} cached subjects.",
+            )
             self.firestore.seed_offline_snapshot(session.uid, "tasks", [self.firestore_document(task.id, task.to_firestore()) for task in self.task_cache])
             self.firestore.seed_offline_snapshot(session.uid, "subjects", [self.firestore_document(subject.id, subject.to_firestore()) for subject in self.subject_cache])
             self._render(
@@ -163,8 +226,13 @@ class StudyWorkspace:
             "%s study data for the authenticated workspace.",
             "Initializing" if initial_startup else "Refreshing",
         )
+        self.record_startup_event(
+            "study data retrieval", "started", "Requesting tasks and subjects from Firestore or the offline mirror."
+        )
         try:
-            self.task_cache, self.subject_cache = await self._load_data(session)
+            self.task_cache, self.subject_cache = await asyncio.wait_for(
+                self._load_data(session), timeout=self._STARTUP_DATA_TIMEOUT_SECONDS
+            )
             if load_request_id != self._load_request_id:
                 return
             self._data_available = True
@@ -179,6 +247,25 @@ class StudyWorkspace:
                 len(self.task_cache),
                 len(self.subject_cache),
             )
+            self.record_startup_event(
+                "study data retrieval",
+                "success",
+                f"Loaded {len(self.task_cache)} tasks and {len(self.subject_cache)} subjects.",
+            )
+        except asyncio.TimeoutError as error:
+            self.record_startup_event(
+                "study data retrieval",
+                "error",
+                f"{type(error).__name__}: task/subject retrieval exceeded {self._STARTUP_DATA_TIMEOUT_SECONDS} seconds.",
+            )
+            error_message = (
+                "Study data loading timed out after "
+                f"{self._STARTUP_DATA_TIMEOUT_SECONDS} seconds. "
+                "Review the startup diagnostics and retry."
+            )
+            if account_changed:
+                self.task_cache = []
+                self.subject_cache = []
         except AuthenticationRequiredError:
             if load_request_id != self._load_request_id:
                 return
@@ -189,6 +276,9 @@ class StudyWorkspace:
             self._data_available = False
             self._startup_state = "ready"
             self._clear_ai_state()
+            self.record_startup_event(
+                "study data retrieval", "error", "AuthenticationRequiredError: The session changed during data loading."
+            )
             self.on_unauthenticated()
             return
         except FirestoreError as error:
@@ -200,6 +290,9 @@ class StudyWorkspace:
                 error,
             )
             error_message = str(error)
+            self.record_startup_event(
+                "study data retrieval", "error", f"{type(error).__name__}: {error_message}"
+            )
             self._offline_mode = "Could not reach" in error_message or "internet connection" in error_message
             if account_changed:
                 self.task_cache = []
@@ -209,6 +302,9 @@ class StudyWorkspace:
                 return
             logger.exception("Saved study data could not be validated.")
             error_message = f"Could not read saved study data: {error}"
+            self.record_startup_event(
+                "study data validation", "error", f"{type(error).__name__}: {error_message}"
+            )
             if account_changed:
                 self.task_cache = []
                 self.subject_cache = []
@@ -235,6 +331,9 @@ class StudyWorkspace:
             and self.auth.session.uid == uid
             and self._loading_status is not None
         ):
+            self.record_startup_event(
+                "study data retrieval", "warning", "No completion after 5 seconds; the operation is still running."
+            )
             self._loading_status.value = (
                 "Still connecting. This can take a moment on a slow network."
             )
@@ -246,6 +345,11 @@ class StudyWorkspace:
             "Loading your tasks and subjects...",
             color=palette.secondary_text,
             text_align=ft.TextAlign.CENTER,
+        )
+        self._diagnostic_view = ft.ListView(
+            controls=self._diagnostic_controls(),
+            spacing=3,
+            auto_scroll=True,
         )
         self.page.clean()
         self.page.add(
@@ -266,6 +370,21 @@ class StudyWorkspace:
                         ),
                         ft.ProgressRing(color=palette.primary),
                         self._loading_status,
+                        ft.Text(
+                            "Startup diagnostics",
+                            size=14,
+                            weight=ft.FontWeight.BOLD,
+                            color=palette.text,
+                        ),
+                        ft.Container(
+                            content=self._diagnostic_view,
+                            height=230,
+                            width=650,
+                            padding=10,
+                            bgcolor=palette.surface,
+                            border=ft.Border.all(1, palette.border),
+                            border_radius=8,
+                        ),
                     ],
                     alignment=ft.MainAxisAlignment.CENTER,
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -276,12 +395,46 @@ class StudyWorkspace:
                 expand=True,
             )
         )
+        self.record_startup_event(
+            "loading screen", "success", "Visible startup diagnostics are ready."
+        )
+
+    def _diagnostic_panel(self) -> ft.Control:
+        palette = colors_for(self.dark_mode)
+        return ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text(
+                        "Startup diagnostics",
+                        weight=ft.FontWeight.BOLD,
+                        color=palette.text,
+                    ),
+                    ft.Container(
+                        content=ft.ListView(
+                            controls=self._diagnostic_controls(), spacing=3
+                        ),
+                        height=190,
+                        padding=8,
+                        bgcolor=palette.surface,
+                        border=ft.Border.all(1, palette.border),
+                        border_radius=8,
+                    ),
+                ],
+                spacing=6,
+            ),
+            padding=10,
+            bgcolor=palette.accent_surface,
+            border_radius=8,
+        )
 
     async def _load_data(self, session: AuthSession) -> tuple[list[Task], list[Subject]]:
         if self.auth.session is None or self.auth.session.uid != session.uid:
             raise AuthenticationRequiredError(
                 "Your sign-in state changed. Sign in again to continue."
             )
+        self.record_startup_event(
+            "authenticated session check", "success", f"Using the authenticated workspace for user {session.uid[:8]}…"
+        )
         tasks, subjects = await self._load_collections()
         if self.auth.session is None or self.auth.session.uid != session.uid:
             raise AuthenticationRequiredError(
@@ -293,9 +446,33 @@ class StudyWorkspace:
         import asyncio
 
         self.firestore.offline = False
-        tasks, subjects = await asyncio.gather(
-            self.tasks.get_tasks(), self.subjects.get_subjects()
-        )
+        async def load_tasks() -> list[Task]:
+            self.record_startup_event("task retrieval", "started", "Loading tasks.")
+            try:
+                tasks = await self.tasks.get_tasks()
+            except Exception as error:
+                self.record_startup_event(
+                    "task retrieval", "error", f"{type(error).__name__}: {error}"
+                )
+                raise
+            self.record_startup_event("task retrieval", "success", f"Loaded {len(tasks)} tasks.")
+            return tasks
+
+        async def load_subjects() -> list[Subject]:
+            self.record_startup_event("subject retrieval", "started", "Loading subjects.")
+            try:
+                subjects = await self.subjects.get_subjects()
+            except Exception as error:
+                self.record_startup_event(
+                    "subject retrieval", "error", f"{type(error).__name__}: {error}"
+                )
+                raise
+            self.record_startup_event(
+                "subject retrieval", "success", f"Loaded {len(subjects)} subjects."
+            )
+            return subjects
+
+        tasks, subjects = await asyncio.gather(load_tasks(), load_subjects())
         return tasks, subjects
 
     @staticmethod
@@ -353,6 +530,8 @@ class StudyWorkspace:
                     selectable=True,
                 )
             )
+        if self._startup_state in {"initializing", "error"} and self._startup_log:
+            status_controls.append(self._diagnostic_panel())
             status_controls.append(
                 ft.TextButton(
                     "Retry",
@@ -367,7 +546,12 @@ class StudyWorkspace:
                     ft.Container(header, padding=ft.Padding(16, 12, 8, 8)),
                     *status_controls,
                     ft.Container(content=body, expand=True, padding=ft.Padding(16, 4, 16, 12)),
-                    self._navigation_bar(),
+                    ft.SafeArea(
+                        content=self._navigation_bar(),
+                        avoid_intrusions_bottom=True,
+                        maintain_bottom_view_padding=True,
+                        minimum_padding=4,
+                    ),
                 ],
                 spacing=0,
                 expand=True,
@@ -398,7 +582,12 @@ class StudyWorkspace:
         )
         return ft.NavigationBar(
             selected_index=selected_index,
-            height=64,
+            height=80,
+            bgcolor=self._surface_color(),
+            indicator_color=self._accent_surface_color(),
+            label_padding=ft.Padding(0, 2, 0, 6),
+            label_behavior=ft.NavigationBarLabelBehavior.ALWAYS_SHOW,
+            border=ft.Border.only(top=ft.BorderSide(1, colors_for(self.dark_mode).border)),
             destinations=[
                 ft.NavigationBarDestination(icon=ft.Icons.HOME, label="Home"),
                 ft.NavigationBarDestination(icon=ft.Icons.TASK, label="Tasks"),
@@ -1031,6 +1220,11 @@ class StudyWorkspace:
                 on_click=lambda _=None, value=subject_id: self._set_task_filter(
                     "subject_id", value
                 ),
+                on_long_press=(
+                    None
+                    if subject is None
+                    else lambda _=None, item=subject: self._show_subject_context_menu(item)
+                ),
             )
             folders[subject_id] = button
             return button
@@ -1048,6 +1242,88 @@ class StudyWorkspace:
         )
         self._active_subject_folder_buttons = folders
         return strip
+
+    def _show_subject_context_menu(self, subject: Subject) -> None:
+        """Show actions for a subject only after its folder is long-pressed."""
+        if subject.id in self._subject_delete_in_progress:
+            return
+
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text(subject.title),
+                content=ft.Text("Choose an action for this subject."),
+                actions=[
+                    ft.TextButton(
+                        "Cancel", on_click=lambda _: self.page.pop_dialog()
+                    ),
+                    ft.TextButton(
+                        "Delete Subject",
+                        icon=ft.Icons.DELETE,
+                        on_click=lambda _: self._confirm_delete_subject(subject),
+                    ),
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+        )
+
+    def _confirm_delete_subject(self, subject: Subject) -> None:
+        """Confirm the destructive subject + associated-task deletion."""
+        if subject.id in self._subject_delete_in_progress:
+            return
+        task_count = sum(task.subject_id == subject.id for task in self.task_cache)
+        task_word = "task" if task_count == 1 else "tasks"
+        warning = (
+            f"Deleting \"{subject.title}\" will also permanently delete "
+            f"{task_count} associated {task_word}. This cannot be undone."
+            if task_count
+            else f'Delete "{subject.title}"? This cannot be undone.'
+        )
+        delete_button = ft.Button(content="Delete", disabled=False)
+        deleting = False
+
+        async def delete(_: Any = None) -> None:
+            nonlocal deleting
+            if deleting or subject.id in self._subject_delete_in_progress:
+                return
+            deleting = True
+            self._subject_delete_in_progress.add(subject.id)
+            delete_button.disabled = True
+            delete_button.content = "Deleting..."
+            self.page.update()
+            try:
+                await self.subjects.delete_subject(subject.id, delete_tasks=True)
+            except (
+                FirestoreError,
+                DocumentNotFoundError,
+                ModelValidationError,
+                SubjectInUseError,
+                ValueError,
+            ) as error:
+                self.page.pop_dialog()
+                await self.show("tasks", notice=f"Could not delete subject: {error}")
+                return
+            finally:
+                self._subject_delete_in_progress.discard(subject.id)
+            self.page.pop_dialog()
+            if self._task_filter_values["subject_id"] == subject.id:
+                self._task_filter_values["subject_id"] = ""
+            await self.show("tasks", notice="Subject and associated tasks deleted.", refresh=True)
+
+        delete_button.on_click = delete
+        self.page.pop_dialog()
+        self.page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Delete subject?"),
+                content=ft.Text(warning),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: self.page.pop_dialog()),
+                    delete_button,
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+        )
 
     def _refresh_subject_folder_strip(self) -> None:
         for subject_id, button in getattr(
