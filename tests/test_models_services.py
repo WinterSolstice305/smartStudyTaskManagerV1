@@ -66,6 +66,29 @@ class ModelTests(unittest.TestCase):
                 tags=["valid", 3],  # type: ignore[list-item]
             )
 
+    def test_legacy_task_alarm_defaults_off_and_round_trips(self) -> None:
+        legacy_data = {
+            "title": "Study",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        task = Task.from_firestore("task-1", legacy_data)
+        self.assertFalse(task.alarm_enabled)
+        self.assertFalse(task.to_firestore()["alarm_enabled"])
+
+        opted_in = Task(
+            "task-2",
+            "Study",
+            None,
+            alarm_enabled=True,
+        )
+        self.assertTrue(
+            Task.from_firestore("task-2", opted_in.to_firestore()).alarm_enabled
+        )
+
+        with self.assertRaisesRegex(ModelValidationError, "alarm_enabled"):
+            Task("task-3", "Study", None, alarm_enabled="yes")  # type: ignore[arg-type]
+
 
 class ServiceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -107,9 +130,13 @@ class ServiceTests(unittest.TestCase):
                 task_id="problem-set",
             )
             self.assertEqual(task.subject_id, "math")
-            self.assertEqual(
-                (await self.tasks.get_task("problem-set")).title, "Finish problem set"
-            )
+            self.assertTrue(task.alarm_enabled)
+            retrieved = await self.tasks.get_task("problem-set")
+            self.assertIsNotNone(retrieved)
+            if retrieved is None:
+                raise AssertionError("Created task should be available for retrieval.")
+            self.assertEqual(retrieved.title, "Finish problem set")
+            self.assertTrue(retrieved.alarm_enabled)
             self.assertEqual(
                 [item.id for item in await self.tasks.get_tasks()], ["problem-set"]
             )
@@ -123,6 +150,7 @@ class ServiceTests(unittest.TestCase):
                     "category": "exam",
                     "deadline": new_deadline,
                     "tags": ["exam", "review"],
+                    "alarm_enabled": False,
                 },
             )
             self.assertEqual(updated.status, "completed")
@@ -130,8 +158,13 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(updated.category, "exam")
             self.assertEqual(updated.deadline, new_deadline)
             self.assertEqual(updated.tags, ["exam", "review"])
+            self.assertFalse(updated.alarm_enabled)
             persisted = await self.tasks.get_task("problem-set")
+            self.assertIsNotNone(persisted)
+            if persisted is None:
+                raise AssertionError("Updated task should be available for retrieval.")
             self.assertEqual(persisted.status, "completed")
+            self.assertFalse(persisted.alarm_enabled)
             await self.tasks.delete_task("problem-set")
             self.assertIsNone(await self.tasks.get_task("problem-set"))
             with self.assertRaises(DocumentNotFoundError):

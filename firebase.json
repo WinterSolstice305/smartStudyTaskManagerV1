@@ -5,7 +5,10 @@
     "runtime": "nodejs20"
   },
   "firestore": {
-    "rules": "firestore.rules"
+    "database": "(default)",
+    "location": "asia-southeast1",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
   },
   "emulators": {
     "functions": {
@@ -13,6 +16,19 @@
     },
     "firestore": {
       "port": 8080
+    }
+  },
+  "hosting": {
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  },
+  "auth": {
+    "providers": {
+      "emailPassword": true
     }
   }
 }

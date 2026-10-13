@@ -69,6 +69,7 @@ Source: `app/models/task.py`
 | `tags` | `list[str]` | No | `[]` | Comma-separated tags in UI |
 | `created_at` | `datetime` | Yes | `now_utc()` | Creation timestamp |
 | `updated_at` | `datetime` | Yes | `now_utc()` | Last modification timestamp |
+| `alarm_enabled` | `bool` | No | `False` | Deadline-time notification preference; new tasks default to enabled in `TaskService` |
 
 ### Validation rules
 
@@ -77,6 +78,7 @@ Source: `app/models/task.py`
 - if `subject_id` is set, it must be a non-empty string.
 - `priority`, `category`, and `status` must be strings.
 - `tags` must be a list of strings.
+- `alarm_enabled` must be a boolean. Missing fields in historical task documents default to `False`.
 - `deadline`, `created_at`, and `updated_at` must be timezone-aware.
 
 ### Firestore representation
@@ -93,6 +95,7 @@ Source: `app/models/task.py`
     "category": self.category,
     "status": self.status,
     "tags": list(self.tags),
+    "alarm_enabled": self.alarm_enabled,
     "created_at": self.created_at.isoformat(),
     "updated_at": self.updated_at.isoformat(),
 }
@@ -141,10 +144,11 @@ When the Cloud Function is deployed, it writes one usage document per user at:
 ```
 
 The document contains the current UTC `day`, the accepted request `count`, and
-an `updatedAt` server timestamp. It is used only to enforce the function's
-30-request daily limit. The Admin SDK writes it outside the client-side task
-and subject model, and it should not be treated as a user profile or exposed in
-the app UI.
+an `updatedAt` server timestamp. The legacy collection name is retained to
+preserve existing user counts across the provider migration. It is used only
+to enforce the function's 30-request daily limit. The Admin SDK writes it
+outside the client-side task and subject model, and it should not be treated as
+a user profile or exposed in the app UI.
 
 ## Document ID strategy
 

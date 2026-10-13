@@ -3,7 +3,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +25,7 @@ class AuthSession:
     refresh_token: str
     expires_in: str
     is_guest: bool = False
+    is_new_account: bool = False
 
 
 class FirebaseAuthService:
@@ -99,6 +100,7 @@ class FirebaseAuthService:
             session = AuthSession(
                 uid=response["user_id"], email=email, id_token=response["id_token"],
                 refresh_token=response["refresh_token"], expires_in=response["expires_in"],
+                is_new_account=saved.get("is_new_account") is True,
             )
         except (FirebaseAuthError, KeyError, TypeError) as error:
             self._diagnostic("Firebase session refresh", "warning", self._safe_error(error, "Firebase refresh failed; checking for an offline session."))
@@ -117,6 +119,7 @@ class FirebaseAuthService:
                 refresh_token=refresh_token,
                 expires_in=str(max(0, int(expires_at - datetime.now(timezone.utc).timestamp())))
                 if isinstance(expires_at, (int, float)) else "0",
+                is_new_account=saved.get("is_new_account") is True,
             )
             self._session = session
             self._diagnostic("offline session restoration", "success", "Restored the previously authenticated session without network access.")
@@ -131,6 +134,12 @@ class FirebaseAuthService:
     def logout(self) -> None:
         self._session = None
         self._clear_saved_session()
+
+    def complete_new_account_initialization(self) -> None:
+        if self._session is None or not self._session.is_new_account:
+            return
+        self._session = replace(self._session, is_new_account=False)
+        self._save_session(self._session)
 
     async def _authenticate(
         self, operation: str, payload: dict[str, str | bool]
@@ -153,6 +162,7 @@ class FirebaseAuthService:
                 id_token=response["idToken"],
                 refresh_token=response["refreshToken"],
                 expires_in=response["expiresIn"],
+                is_new_account=operation == "signUp",
             )
         except (KeyError, TypeError) as error:
             raise FirebaseAuthError(
@@ -203,6 +213,7 @@ class FirebaseAuthService:
                     "id_token": session.id_token,
                     "refresh_token": session.refresh_token,
                     "expires_at": datetime.now(timezone.utc).timestamp() + lifetime,
+                    "is_new_account": session.is_new_account,
                 }),
                 encoding="utf-8",
             )

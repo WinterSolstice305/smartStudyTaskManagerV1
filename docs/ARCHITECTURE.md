@@ -2,9 +2,8 @@
 
 This project is a single-user desktop client built with Python and Flet. It
 connects directly to Firebase Authentication and Firestore through REST APIs.
-Gemini requests normally pass through the repository's authenticated Firebase
-Cloud Function; direct Gemini access is available only when explicitly enabled
-for local development.
+Groq chat and recommendation requests are sent directly from the client to
+Groq in both local and Android builds.
 
 ## Architectural overview
 
@@ -12,13 +11,19 @@ The runtime is organized around a small set of layers:
 
 - Entry point: `main.py` creates the Flet page and boots the workspace.
 - UI layer: `app/ui` renders screens, dialogs, filters, and task/subject actions.
-- Service layer: `app/services` wraps Firebase Auth, Firestore, and Gemini calls.
-- Function layer: `functions/` verifies Firebase ID tokens and performs
-  server-side Gemini calls.
+- Service layer: `app/services` wraps Firebase Auth, Firestore, and Groq calls.
+- Optional function source: `functions/` contains an authenticated Groq proxy,
+  but the app's AI client does not call it.
 - Domain layer: `app/models` validates and serializes `Subject` and `Task` objects.
-- Configuration: `app/config.py` reads environment variables for Firebase and Gemini.
+- Configuration: `app/config.py` reads environment variables for Firebase and Groq.
 
-At runtime, `StudyWorkspace` centralizes the app state for the signed-in user. It loads tasks and subjects from Firestore, renders the UI, and triggers Gemini recommendations or chat requests with the currently loaded task snapshot.
+At runtime, `StudyWorkspace` centralizes the app state for the signed-in user. It loads tasks and subjects from Firestore, renders the UI, and triggers Groq recommendations or chat requests with the currently loaded task snapshot.
+
+Newly registered accounts receive two ordinary starter tasks during their
+initial workspace load. Completion is recorded in the account's
+`workspace_metadata/premade_tasks_v1` document so interrupted setup can retry
+without duplicating tasks, and later deletion does not restore them. Existing
+accounts are not seeded when they sign in or upgrade.
 
 ## Main components
 
@@ -70,17 +75,24 @@ Provides subject CRUD semantics with validation and a guard against deleting a s
 
 Provides task CRUD semantics, validates allowed field changes, ensures the referenced subject exists, and updates the `updated_at` timestamp on task updates.
 
-### `app.services.gemini`
+### `app.services.groq`
 
 Provides two read-only AI functions:
 
 - `generate_task_recommendations(tasks, subjects=None)`
 - `chat_about_tasks(message, tasks, subjects=None)`
 
-They send the current task snapshot and the Firebase ID token to the configured
-backend. The default is the `generateGemini` Cloud Function derived from
-`FIREBASE_PROJECT_ID`; `GEMINI_BACKEND_URL=direct` instead calls Gemini with a
-local key. They never write task or subject documents to Firestore.
+They send the current task snapshot directly to the Groq Chat Completions API
+using `GROQ_API_KEY`. `AI_BACKEND_URL` must be `direct`; Cloud Functions are
+not used for AI requests. The key comes from the repository-root `.env` on
+desktop or app-private storage configured through Settings on Android. These
+functions never write task or subject documents to Firestore.
+
+### `app.services.ai_config`
+
+Loads the repository-root `.env` for local Python runs and reads/writes the
+Groq key in `storage_root()/groq-config.json`. On Android, Flet supplies the
+app-private base directory through `FLET_APP_STORAGE_DATA`.
 
 ### `app.services.study_cache.StudyCache` and `app.ui.theme`
 
@@ -89,12 +101,10 @@ initial startup, the workspace can show that snapshot while it refreshes from
 Firestore. The theme module persists the selected light/dark preference. These
 files provide local convenience state, not cross-device synchronization.
 
-### `functions/index.js`
+### Optional `functions/index.js`
 
-Exports the `generateGemini` HTTPS Cloud Function in `us-central1`. It requires
-a Firebase bearer token, validates the allowed payload, retrieves the Gemini
-key from Firebase Secret Manager, and tracks a 30-request-per-user UTC-day
-limit in the `_gemini_usage` collection using the Admin SDK.
+Exports `generateGroq` as an optional authenticated proxy. The desktop and APK
+client do not depend on or call it.
 
 ## Startup sequence
 
@@ -184,33 +194,26 @@ Write operations follow the same path with a user-scoped resource path and an ID
 ```mermaid
 sequenceDiagram
     participant Workspace as StudyWorkspace
-    participant Gemini as app.services.gemini
-    participant Function as generateGemini Cloud Function
-    participant API as Gemini API
-    participant Usage as Firestore usage counter
+    participant Groq as app.services.groq
+    participant API as Groq API
 
-    Workspace->>Gemini: generate_task_recommendations(tasks, subjects, id_token)
-    Gemini->>Gemini: filter incomplete tasks, sort by urgency
-    Gemini->>Function: POST prompt + schema + Firebase bearer token
-    Function->>Function: verify ID token and validate payload
-    Function->>Usage: transactionally consume daily request
-    Function->>API: generated prompt + schema
-    API-->>Function: response
-    Function-->>Gemini: JSON response
-    Gemini-->>Workspace: TaskRecommendationResult
+    Workspace->>Groq: generate_task_recommendations(tasks, subjects)
+    Groq->>Groq: filter incomplete tasks, sort by urgency
+    Groq->>API: POST messages + schema + Groq bearer key
+    API-->>Groq: response
+    Groq-->>Workspace: TaskRecommendationResult
     Workspace-->>UI: render recommendation cards
 ```
 
-The Gemini flow is intentionally read-only for task and subject data. The
-function does write its server-managed daily usage counter. In direct mode the
-client bypasses the function and calls Gemini with a local development key.
+The Groq flow is intentionally read-only for task and subject data. Direct
+client calls require a key supplied by that desktop or APK user.
 
 ## Error-handling strategy
 
 The project uses a layered error approach:
 
 - Domain validation errors raise `ModelValidationError` from `app.models`.
-- Service-layer failures raise custom exceptions such as `FirebaseAuthError`, `FirestoreError`, and `GeminiServiceError`.
+- Service-layer failures raise custom exceptions such as `FirebaseAuthError`, `FirestoreError`, and `GroqServiceError`.
 - UI code catches these and displays user-safe explanations.
 - Firestore permission errors and expired sessions are converted into user-facing messages without exposing raw Firebase or Security Rules details.
 
@@ -244,20 +247,18 @@ This means tasks, subjects, and any other docs under a user’s tree cannot be a
 
 - Firebase Authentication via Identity Toolkit REST API
 - Firestore via REST API
-- Gemini via a Firebase Cloud Function and Google GenAI; direct local calls are
-  an explicit fallback
+- Groq Chat Completions called directly by the client
 - Flet for the desktop UI
 
 The app has no general-purpose application backend, queueing system, or local
-database. Its Cloud Function is limited to protected Gemini requests and usage
-accounting.
+database. Firebase Cloud Functions are not required for AI requests.
 
 ## Notable architectural trade-offs
 
 - Client-side Firebase access keeps the project small and easy to run locally, but it exposes the Firebase web API key and the app’s data access pattern to the client runtime.
 - Firestore security is enforced by rules, but the app’s trust model assumes the client only uses the authenticated user’s own data.
 - AI recommendations are computed from a task snapshot and never mutate the
-  underlying task/subject model; the server only records request usage.
+  underlying task/subject model.
 - Local session, cache, and appearance state improve startup continuity but are
   device-local and not an offline synchronization solution.
 
@@ -269,10 +270,9 @@ The repo contains an operational client for:
 - authenticated Firestore access
 - subject/task CRUD
 - dashboard and task calendar views
-- AI recommendations and chat via Gemini
+- AI recommendations and chat via Groq
 - Firebase security rules and rule tests
 
 The repository is not a full production backend or a multi-user service
-platform. It is a Firebase-backed client with a narrowly scoped function for
-AI requests; live function deployment and live Gemini behavior remain
-unverified in this repository.
+platform. It is a Firebase-backed client with direct Groq requests; live Groq
+behavior and Android APK builds remain unverified in this repository.

@@ -1,6 +1,5 @@
 "use strict";
 
-const { GoogleGenAI } = require("@google/genai");
 const { initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const {
@@ -13,24 +12,24 @@ const logger = require("firebase-functions/logger");
 
 const {
   RequestError,
-  classifyGeminiError,
+  classifyGroqError,
+  groqPayload,
   validatePayload,
-} = require("./src/gemini");
+} = require("./src/groq");
 
 initializeApp();
 
-const geminiApiKey = defineSecret("GEMINI_API_KEY");
-const geminiModel = defineString("GEMINI_MODEL", {
-  default: "gemini-3.8-flash",
-});
-const geminiFallbackModels = defineString("GEMINI_MODEL_FALLBACKS", {
-  default: "",
+const groqApiKey = defineSecret("GROQ_API_KEY");
+const groqModel = defineString("GROQ_MODEL", {
+  default: "openai/gpt-oss-20b",
 });
 const DAILY_REQUEST_LIMIT = 30;
+const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 async function consumeDailyRequest(uid) {
   const firestore = getFirestore();
   const userDocumentId = Buffer.from(uid).toString("base64url");
+  // Keep the legacy collection path so deployment does not reset user limits.
   const usageRef = firestore.collection("_gemini_usage").doc(userDocumentId);
   const day = new Date().toISOString().slice(0, 10);
 
@@ -50,7 +49,7 @@ async function consumeDailyRequest(uid) {
   });
 }
 
-async function handleGeminiRequest(req, res) {
+async function handleGroqRequest(req, res) {
   if (req.method !== "POST") {
     res.set("Allow", "POST");
     res.status(405).json({
@@ -90,18 +89,13 @@ async function handleGeminiRequest(req, res) {
     return;
   }
 
-  let apiKey;
-  try {
-    apiKey = geminiApiKey.value();
-  } catch {
-    apiKey = "";
-  }
+  const apiKey = groqApiKey.value().trim();
   if (!apiKey) {
-    logger.error("Gemini request rejected: category=missing_server_secret");
+    logger.error("Groq request rejected: category=missing_server_secret");
     res.status(503).json({
       error: {
-        code: "GEMINI_CONFIGURATION",
-        message: "The AI service is not configured. Please contact the administrator.",
+        code: "GROQ_NOT_CONFIGURED",
+        message: "The AI service is not configured. Contact the administrator.",
       },
     });
     return;
@@ -111,7 +105,7 @@ async function handleGeminiRequest(req, res) {
   try {
     allowed = await consumeDailyRequest(decodedToken.uid);
   } catch {
-    logger.error("Gemini request rejected: category=usage_store_failure");
+    logger.error("Groq request rejected: category=usage_store_failure");
     res.status(503).json({
       error: {
         code: "USAGE_STORE_UNAVAILABLE",
@@ -121,82 +115,80 @@ async function handleGeminiRequest(req, res) {
     return;
   }
   if (!allowed) {
-    logger.warn("Gemini request rejected: category=user_daily_limit status=429");
+    logger.warn("Groq request rejected: category=user_daily_limit status=429");
     res.status(429).json({
       error: {
-        code: "GEMINI_DAILY_LIMIT",
+        code: "GROQ_DAILY_LIMIT",
         message: "You've reached today's AI request limit.",
       },
     });
     return;
   }
 
-  const primaryModel = geminiModel.value().trim() || "gemini-3.8-flash";
-  const fallbackModels = geminiFallbackModels.value()
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-  const models = [...new Set([primaryModel, ...fallbackModels])];
-  let lastFailure;
+  const model = groqModel.value().trim() || "openai/gpt-oss-20b";
   try {
-    const client = new GoogleGenAI({ apiKey });
-    for (const model of models) {
-      try {
-        const response = await client.models.generateContent({
-          model,
-          contents: input.prompt,
-          config: {
-            systemInstruction: input.systemInstruction,
-            maxOutputTokens: input.maxOutputTokens,
-            temperature: 0.2,
-            ...(input.responseSchema
-              ? {
-                  responseMimeType: "application/json",
-                  responseSchema: input.responseSchema,
-                }
-              : {}),
-          },
-        });
-        if (typeof response.text === "string" && response.text.trim()) {
-          res.status(200).json({ text: response.text });
-          return;
-        }
-        lastFailure = new Error("Gemini returned an empty response.");
-      } catch (error) {
-        lastFailure = error;
-        logger.warn("Gemini model failed; trying the next configured model: model=%s", model);
-        const failureCategory = classifyGeminiError(error).category;
-        if (
-          failureCategory === "network_failure" ||
-          failureCategory === "network_timeout"
-        ) {
-          break;
-        }
-      }
-    }
-    const failure = lastFailure
-      ? classifyGeminiError(lastFailure)
-      : {
-          status: 503,
-          code: "GEMINI_UNAVAILABLE",
-          message: "All configured Gemini models are unavailable.",
-        };
-    logger.warn(
-      "Gemini request failed: category=%s status=%s models=%s",
-      failure.category,
-      failure.status,
-      models.join(","),
-    );
-    res.status(failure.status).json({
-      error: { code: failure.code, message: failure.message },
+    const response = await fetch(GROQ_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(groqPayload(input, model)),
+      signal: AbortSignal.timeout(50_000),
     });
+    if (!response.ok) {
+      let providerError = {};
+      try {
+        const body = await response.json();
+        providerError = body?.error ?? {};
+      } catch {
+        // The status code is sufficient to classify an unreadable error body.
+      }
+      const failure = classifyGroqError({
+        status: response.status,
+        code: providerError?.code,
+      });
+      logger.warn(
+        "Groq request failed: category=%s status=%s model=%s",
+        failure.category,
+        response.status,
+        model,
+      );
+      res.status(failure.status).json({
+        error: { code: failure.code, message: failure.message },
+      });
+      return;
+    }
+
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      res.status(502).json({
+        error: {
+          code: "GROQ_INVALID_RESPONSE",
+          message: "The AI service returned an invalid response. Please retry.",
+        },
+      });
+      return;
+    }
+    const text = body?.choices?.[0]?.message?.content;
+    if (typeof text !== "string" || !text.trim()) {
+      res.status(502).json({
+        error: {
+          code: "GROQ_INVALID_RESPONSE",
+          message: "The AI service returned an empty or invalid response. Please retry.",
+        },
+      });
+      return;
+    }
+    res.status(200).json({ text: text.trim() });
   } catch (error) {
-    const failure = classifyGeminiError(error);
+    const failure = classifyGroqError(error);
     logger.warn(
-      "Gemini request failed: category=%s status=%s models=%s",
+      "Groq request failed: category=%s model=%s",
       failure.category,
-      Number(error?.status ?? error?.code) || "network",
-      models.join(","),
+      model,
     );
     res.status(failure.status).json({
       error: { code: failure.code, message: failure.message },
@@ -204,13 +196,13 @@ async function handleGeminiRequest(req, res) {
   }
 }
 
-exports.generateGemini = onRequest(
+exports.generateGroq = onRequest(
   {
     region: "us-central1",
     cors: true,
     timeoutSeconds: 60,
     maxInstances: 10,
-    secrets: [geminiApiKey],
+    secrets: [groqApiKey],
   },
-  handleGeminiRequest,
+  handleGroqRequest,
 );

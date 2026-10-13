@@ -58,15 +58,18 @@ class StudyCache:
         except OSError as error:
             logger.warning("Study cache write failed for %s: %s", self._path, error)
 
-    def clear(self, uid: str) -> None:
+    def clear(self, uid: str) -> bool:
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
             if isinstance(payload, dict) and uid in payload:
                 del payload[uid]
                 self._path.write_text(json.dumps(payload), encoding="utf-8")
+            return True
         except FileNotFoundError:
-            pass
+            return True
         except PermissionError:
             logger.error("Study cache clear permission denied for %s", self._path)
+            return False
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             logger.warning("Study cache clear failed for %s: %s", self._path, error)
+            return False

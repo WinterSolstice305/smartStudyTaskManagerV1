@@ -1,19 +1,21 @@
 import asyncio
 import json
 import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 
 from app.models.subject import Subject
 from app.models.task import Task
-from app.services import gemini
+from app.services import ai_config
+from app.services import groq
 from app.services.firebase_auth import AuthSession, FirebaseAuthService
-from app.services.gemini import (
-    GeminiServiceError,
+from app.services.groq import (
+    GroqServiceError,
     TaskRecommendationResult,
     chat_about_tasks,
     generate_task_recommendations,
@@ -67,10 +69,10 @@ class FakePage:
         return None
 
 
-class GeminiServiceTests(unittest.TestCase):
+class GroqServiceTests(unittest.TestCase):
     def test_empty_and_completed_only_lists_skip_the_api(self) -> None:
         async def exercise() -> None:
-            with patch("app.services.gemini._generate_text", new_callable=AsyncMock) as call:
+            with patch("app.services.groq._generate_text", new_callable=AsyncMock) as call:
                 empty = await generate_task_recommendations([])
                 completed = await generate_task_recommendations(
                     [make_task("done", "Completed essay", status="completed")]
@@ -98,7 +100,7 @@ class GeminiServiceTests(unittest.TestCase):
                 }
             )
             with patch(
-                "app.services.gemini._generate_text",
+                "app.services.groq._generate_text",
                 new_callable=AsyncMock,
                 return_value=response,
             ) as call:
@@ -115,8 +117,8 @@ class GeminiServiceTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_valid_key_and_mocked_sdk_response_produce_recommendations(self) -> None:
-        sdk_calls: list[dict[str, object]] = []
+    def test_valid_key_and_mocked_http_response_produce_recommendations(self) -> None:
+        requests: list[tuple[str, dict[str, object], dict[str, str]]] = []
         output = json.dumps(
             {
                 "summary": "Work on the nearest deadline first.",
@@ -126,24 +128,29 @@ class GeminiServiceTests(unittest.TestCase):
             }
         )
 
-        class FakeAsyncClient:
-            class Models:
-                async def generate_content(self, **kwargs: object) -> object:
-                    sdk_calls.append(kwargs)
-                    return SimpleNamespace(text=output)
+        class FakeHttpClient:
+            def __init__(self, *, timeout: float) -> None:
+                self.timeout = timeout
 
-            models = Models()
-
-            async def __aenter__(self) -> "FakeAsyncClient":
+            async def __aenter__(self) -> "FakeHttpClient":
                 return self
 
             async def __aexit__(self, *_: object) -> None:
                 return None
 
-        class FakeClient:
-            def __init__(self, **kwargs: object) -> None:
-                self.api_key = kwargs["api_key"]
-                self.aio = FakeAsyncClient()
+            async def post(
+                self,
+                url: str,
+                *,
+                json: dict[str, object],
+                headers: dict[str, str],
+            ) -> object:
+                requests.append((url, json, headers))
+                return httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"content": output}}]},
+                    request=httpx.Request("POST", url),
+                )
 
         async def exercise() -> None:
             task = make_task(
@@ -155,30 +162,36 @@ class GeminiServiceTests(unittest.TestCase):
                 patch.dict(
                     os.environ,
                     {
-                        "GEMINI_BACKEND_URL": "direct",
-                        "GEMINI_API_KEY": "test-key",
-                        "GEMINI_MODEL": "test-flash",
+                        "AI_BACKEND_URL": "direct",
+                        "GROQ_API_KEY": "test-key",
+                        "GROQ_MODEL": "test-model",
                     },
                 ),
-                patch("app.services.gemini.genai.Client", FakeClient),
+                patch("app.services.groq.httpx.AsyncClient", FakeHttpClient),
             ):
                 result = await generate_task_recommendations([task])
 
             self.assertEqual(result.recommendations[0].title, "Submit lab report")
-            self.assertEqual(len(sdk_calls), 1)
-            self.assertEqual(sdk_calls[0]["model"], "test-flash")
-            self.assertIn("deadline_status", sdk_calls[0]["contents"])
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0][0], groq._GROQ_API_URL)
+            request_body = requests[0][1]
+            self.assertEqual(request_body["model"], "test-model")
+            prompt = request_body["messages"][1]["content"]
+            self.assertIn("deadline_status", prompt)
             self.assertEqual(
-                sdk_calls[0]["config"].response_mime_type, "application/json"
+                request_body["response_format"]["type"], "json_schema"
             )
-            self.assertNotIn("test-key", sdk_calls[0]["contents"])
+            self.assertNotIn("test-key", str(request_body))
+            self.assertEqual(
+                requests[0][2]["Authorization"], "Bearer test-key"
+            )
 
         asyncio.run(exercise())
 
     def test_recommendations_reject_unknown_task_ids(self) -> None:
         async def exercise() -> None:
             with patch(
-                "app.services.gemini._generate_text",
+                "app.services.groq._generate_text",
                 new_callable=AsyncMock,
                 return_value=json.dumps(
                     {
@@ -189,7 +202,7 @@ class GeminiServiceTests(unittest.TestCase):
                     }
                 ),
             ):
-                with self.assertRaisesRegex(GeminiServiceError, "outside your current list"):
+                with self.assertRaisesRegex(GroqServiceError, "outside your current list"):
                     await generate_task_recommendations(
                         [make_task("real", "Real task")]
                     )
@@ -204,7 +217,7 @@ class GeminiServiceTests(unittest.TestCase):
 
         async def exercise() -> None:
             with patch(
-                "app.services.gemini._generate_text",
+                "app.services.groq._generate_text",
                 new_callable=AsyncMock,
                 return_value="Start with chapter 4.",
             ) as call:
@@ -224,58 +237,105 @@ class GeminiServiceTests(unittest.TestCase):
         async def exercise() -> None:
             with patch.dict(
                 os.environ,
-                {"GEMINI_BACKEND_URL": "direct"},
+                {"AI_BACKEND_URL": "direct"},
                 clear=True,
-            ):
-                with self.assertRaisesRegex(GeminiServiceError, "GEMINI_API_KEY"):
+            ), patch("app.services.ai_config._stored_api_key", return_value=""):
+                with self.assertRaisesRegex(
+                    GroqServiceError, "GROQ_API_KEY"
+                ) as raised:
                     await chat_about_tasks("Plan my week", [])
+            self.assertEqual(raised.exception.availability, "unknown")
+
+        asyncio.run(exercise())
+
+    def test_groq_key_is_saved_in_app_storage_and_environment_takes_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "groq-config.json"
+            with (
+                patch("app.services.ai_config.storage_path", return_value=config_path),
+                patch(
+                    "app.services.ai_config.ensure_storage_root",
+                    side_effect=lambda: Path(directory),
+                ),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                ai_config.save_groq_api_key("gsk-device-key")
+                self.assertEqual(ai_config.get_groq_api_key(), "gsk-device-key")
+                self.assertTrue(ai_config.groq_api_key_configured())
+
+                os.environ["GROQ_API_KEY"] = "gsk-env-key"
+                self.assertEqual(ai_config.get_groq_api_key(), "gsk-env-key")
+
+                del os.environ["GROQ_API_KEY"]
+                ai_config.clear_saved_groq_api_key()
+                self.assertFalse(ai_config.groq_api_key_configured())
+
+    def test_ai_backend_must_be_direct_and_does_not_fall_back_to_firebase(self) -> None:
+        async def exercise() -> None:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "AI_BACKEND_URL": "https://example.test/generateGroq",
+                    },
+                    clear=True,
+                ),
+                patch("app.services.groq.httpx.AsyncClient") as http_client,
+            ):
+                with self.assertRaisesRegex(
+                    GroqServiceError, "must be set to 'direct'"
+                ):
+                    await groq._generate_text(
+                        "Plan my week",
+                        system_instruction="Use study context.",
+                        max_output_tokens=700,
+                        id_token="firebase-id-token",
+                    )
+            http_client.assert_not_called()
 
         asyncio.run(exercise())
 
     def test_network_failure_returns_a_user_safe_error(self) -> None:
-        class FakeAsyncClient:
-            models = SimpleNamespace(
-                generate_content=AsyncMock(
-                    side_effect=httpx.ConnectError("network unavailable")
-                )
-            )
+        class FakeHttpClient:
+            def __init__(self, *, timeout: float) -> None:
+                self.timeout = timeout
 
-            async def __aenter__(self) -> "FakeAsyncClient":
+            async def __aenter__(self) -> "FakeHttpClient":
                 return self
 
             async def __aexit__(self, *_: object) -> None:
                 return None
 
-        class FakeClient:
-            def __init__(self, **_: object) -> None:
-                self.aio = FakeAsyncClient()
+            async def post(self, url: str, **_: object) -> httpx.Response:
+                raise httpx.ConnectError("network unavailable")
 
         async def exercise() -> None:
             with (
                 patch.dict(
                     os.environ,
                     {
-                        "GEMINI_BACKEND_URL": "direct",
-                        "GEMINI_API_KEY": "test-key",
+                        "AI_BACKEND_URL": "direct",
+                        "GROQ_API_KEY": "test-key",
                     },
                 ),
-                patch("app.services.gemini.genai.Client", FakeClient),
+                patch("app.services.groq.httpx.AsyncClient", FakeHttpClient),
             ):
-                with self.assertRaisesRegex(GeminiServiceError, "Could not reach Gemini"):
+                with self.assertRaisesRegex(
+                    GroqServiceError, "Could not reach the AI service"
+                ) as raised:
                     await chat_about_tasks("Plan my week", [])
+            self.assertEqual(raised.exception.availability, "unavailable")
 
         asyncio.run(exercise())
 
-    def test_backend_requests_use_firebase_bearer_token_without_client_key(self) -> None:
-        requests: list[
-            tuple[str, dict[str, object], dict[str, str]]
-        ] = []
+    def test_unset_backend_setting_defaults_to_direct_groq_request(self) -> None:
+        requests: list[tuple[str, dict[str, object], dict[str, str]]] = []
 
-        class FakeBackendClient:
+        class FakeHttpClient:
             def __init__(self, *, timeout: float) -> None:
                 self.timeout = timeout
 
-            async def __aenter__(self) -> "FakeBackendClient":
+            async def __aenter__(self) -> "FakeHttpClient":
                 return self
 
             async def __aexit__(self, *_: object) -> None:
@@ -291,7 +351,7 @@ class GeminiServiceTests(unittest.TestCase):
                 requests.append((url, json, headers))
                 return httpx.Response(
                     200,
-                    json={"text": "Plan one focused study block."},
+                    json={"choices": [{"message": {"content": "Start with math."}}]},
                     request=httpx.Request("POST", url),
                 )
 
@@ -299,61 +359,37 @@ class GeminiServiceTests(unittest.TestCase):
             with (
                 patch.dict(
                     os.environ,
-                    {
-                        "GEMINI_BACKEND_URL": "https://ai.example.test/generateGemini",
-                        "GEMINI_API_KEY": "must-not-be-used",
-                    },
+                    {"GROQ_API_KEY": "test-key"},
+                    clear=True,
                 ),
-                patch(
-                    "app.services.gemini.httpx.AsyncClient",
-                    FakeBackendClient,
-                ),
+                patch("app.services.groq.httpx.AsyncClient", FakeHttpClient),
             ):
-                response = await gemini._generate_text(
+                response = await groq._generate_text(
                     "Plan my week",
                     system_instruction="Use study context.",
                     max_output_tokens=700,
-                    id_token="firebase-id-token",
                 )
 
-            self.assertEqual(response, "Plan one focused study block.")
-            self.assertEqual(requests[0][0], "https://ai.example.test/generateGemini")
-            request_headers = requests[0][2]
-            self.assertEqual(
-                request_headers["Authorization"], "Bearer firebase-id-token"
-            )
-            request_body = requests[0][1]
-            self.assertNotIn("must-not-be-used", str(request_body))
+            self.assertEqual(response, "Start with math.")
+            self.assertEqual(requests[0][0], groq._GROQ_API_URL)
+            self.assertEqual(requests[0][2]["Authorization"], "Bearer test-key")
 
         asyncio.run(exercise())
-
-    def test_backend_quota_error_is_actionable_and_logs_no_response_body(self) -> None:
-        class FakeBackendClient:
+    def test_rate_limit_returns_a_retry_message(self) -> None:
+        class FakeHttpClient:
             def __init__(self, *, timeout: float) -> None:
                 self.timeout = timeout
 
-            async def __aenter__(self) -> "FakeBackendClient":
+            async def __aenter__(self) -> "FakeHttpClient":
                 return self
 
             async def __aexit__(self, *_: object) -> None:
                 return None
 
-            async def post(
-                self,
-                url: str,
-                *,
-                json: dict[str, object],
-                headers: dict[str, str],
-            ) -> httpx.Response:
-                _ = json, headers
+            async def post(self, url: str, **_: object) -> httpx.Response:
                 return httpx.Response(
                     429,
-                    json={
-                        "error": {
-                            "code": "GEMINI_DAILY_LIMIT",
-                            "message": "sensitive-backend-detail",
-                        }
-                    },
+                    json={"error": {"message": "sensitive provider detail"}},
                     request=httpx.Request("POST", url),
                 )
 
@@ -361,116 +397,60 @@ class GeminiServiceTests(unittest.TestCase):
             with (
                 patch.dict(
                     os.environ,
-                    {"GEMINI_BACKEND_URL": "https://ai.example.test/generateGemini"},
-                ),
-                patch("app.services.gemini.httpx.AsyncClient", FakeBackendClient),
-                self.assertLogs(gemini.logger, level="WARNING") as captured,
-            ):
-                with self.assertRaisesRegex(
-                    GeminiServiceError, "today's AI request limit"
-                ):
-                    await gemini._generate_text(
-                        "Plan my week",
-                        system_instruction="Use study context.",
-                        max_output_tokens=700,
-                        id_token="firebase-id-token",
-                    )
-
-            diagnostic = "\n".join(captured.output)
-            self.assertIn("category=user_daily_limit", diagnostic)
-            self.assertIn("status=429", diagnostic)
-            self.assertNotIn("sensitive-backend-detail", diagnostic)
-
-        asyncio.run(exercise())
-
-    def test_rate_limit_returns_a_retry_message(self) -> None:
-        class FakeAPIError(Exception):
-            code = 429
-
-        class FakeAsyncClient:
-            class Models:
-                async def generate_content(self, **_: object) -> object:
-                    raise FakeAPIError()
-
-            models = Models()
-
-            async def __aenter__(self) -> "FakeAsyncClient":
-                return self
-
-            async def __aexit__(self, *_: object) -> None:
-                return None
-
-        class FakeClient:
-            def __init__(self, **_: object) -> None:
-                self.aio = FakeAsyncClient()
-
-        async def exercise() -> None:
-            with (
-                patch.dict(
-                    os.environ,
                     {
-                        "GEMINI_BACKEND_URL": "direct",
-                        "GEMINI_API_KEY": "test-key",
+                        "AI_BACKEND_URL": "direct",
+                        "GROQ_API_KEY": "sensitive-api-key",
                     },
                 ),
-                patch("app.services.gemini.genai.Client", FakeClient),
-                patch.object(gemini.errors, "APIError", FakeAPIError),
+                patch("app.services.groq.httpx.AsyncClient", FakeHttpClient),
             ):
-                with self.assertRaisesRegex(GeminiServiceError, "quota or rate limit"):
+                with self.assertRaisesRegex(
+                    GroqServiceError, "quota or rate limit"
+                ) as raised:
                     await chat_about_tasks("Plan my week", [])
+            self.assertEqual(raised.exception.availability, "available")
 
         asyncio.run(exercise())
 
     def test_api_status_is_logged_without_error_body_or_credentials(self) -> None:
-        api_error = gemini.errors.APIError(
-            503,
-            {
-                "error": {
-                    "status": "UNAVAILABLE",
-                    "message": "sensitive-response-detail",
-                }
-            },
-        )
+        class FakeHttpClient:
+            def __init__(self, *, timeout: float) -> None:
+                self.timeout = timeout
 
-        class FakeAsyncClient:
-            class Models:
-                async def generate_content(self, **_: object) -> object:
-                    raise api_error
-
-            models = Models()
-
-            async def __aenter__(self) -> "FakeAsyncClient":
+            async def __aenter__(self) -> "FakeHttpClient":
                 return self
 
             async def __aexit__(self, *_: object) -> None:
                 return None
 
-        class FakeClient:
-            def __init__(self, **_: object) -> None:
-                self.aio = FakeAsyncClient()
+            async def post(self, url: str, **_: object) -> httpx.Response:
+                return httpx.Response(
+                    503,
+                    json={"error": {"message": "sensitive-response-detail"}},
+                    request=httpx.Request("POST", url),
+                )
 
         async def exercise() -> None:
             with (
                 patch.dict(
                     os.environ,
                     {
-                        "GEMINI_BACKEND_URL": "direct",
-                        "GEMINI_API_KEY": "sensitive-api-key",
-                        "GEMINI_MODEL": "gemini-3.8-flash",
+                        "AI_BACKEND_URL": "direct",
+                        "GROQ_API_KEY": "sensitive-api-key",
+                        "GROQ_MODEL": "test-groq-model",
                     },
                 ),
-                patch("app.services.gemini.genai.Client", FakeClient),
-                self.assertLogs(gemini.logger, level="WARNING") as captured,
+                patch("app.services.groq.httpx.AsyncClient", FakeHttpClient),
+                self.assertLogs(groq.logger, level="WARNING") as captured,
             ):
                 with self.assertRaisesRegex(
-                    GeminiServiceError, "temporarily unavailable"
+                    GroqServiceError, "temporarily unavailable"
                 ):
                     await chat_about_tasks("Plan my week", [])
 
             diagnostic = "\n".join(captured.output)
-            self.assertIn("category=upstream_server", diagnostic)
+            self.assertIn("category=backend_or_upstream_failure", diagnostic)
             self.assertIn("status=503", diagnostic)
-            self.assertIn("model=gemini-3.8-flash", diagnostic)
             self.assertNotIn("sensitive-api-key", diagnostic)
             self.assertNotIn("sensitive-response-detail", diagnostic)
 
@@ -479,11 +459,11 @@ class GeminiServiceTests(unittest.TestCase):
     def test_malformed_structured_response_is_rejected(self) -> None:
         async def exercise() -> None:
             with patch(
-                "app.services.gemini._generate_text",
+                "app.services.groq._generate_text",
                 new_callable=AsyncMock,
                 return_value='{"summary":"Only summary"}',
             ):
-                with self.assertRaisesRegex(GeminiServiceError, "incomplete recommendation"):
+                with self.assertRaisesRegex(GroqServiceError, "incomplete recommendation"):
                     await generate_task_recommendations(
                         [make_task("one", "Study")]
                     )
@@ -497,12 +477,12 @@ class GeminiServiceTests(unittest.TestCase):
         undated = make_task("none", "No deadline")
 
         self.assertEqual(
-            gemini._task_context(overdue, {}, now)["deadline_status"], "overdue"
+            groq._task_context(overdue, {}, now)["deadline_status"], "overdue"
         )
         self.assertEqual(
-            gemini._task_context(due_soon, {}, now)["deadline_status"], "due_soon"
+            groq._task_context(due_soon, {}, now)["deadline_status"], "due_soon"
         )
-        undated_context = gemini._task_context(undated, {}, now)
+        undated_context = groq._task_context(undated, {}, now)
         self.assertEqual(undated_context["deadline_status"], "no_deadline")
         self.assertIsNone(undated_context["seconds_until_deadline"])
 
@@ -641,6 +621,146 @@ class GeminiServiceTests(unittest.TestCase):
             create.assert_not_awaited()
             update.assert_not_awaited()
             delete.assert_not_awaited()
+            self.assertEqual(workspace._ai_availability, "available")
+            self.assertEqual(
+                [entry["role"] for entry in workspace._chat_history],
+                ["user", "assistant"],
+            )
+
+        asyncio.run(exercise())
+
+    def test_failed_chat_removes_only_its_message_and_allows_retry(self) -> None:
+        async def exercise() -> None:
+            auth = FirebaseAuthService("test-key")
+            auth._session = fake_session("user-a")
+            workspace = StudyWorkspace(
+                FakePage(), auth, "test-project", on_unauthenticated=lambda: None
+            )
+            workspace.route = "assistant"
+            workspace._data_uid = "user-a"
+            workspace._data_available = True
+            workspace._chat_history = [
+                {"id": "older-message", "role": "user", "text": "What is due?"},
+                {
+                    "id": "older-response",
+                    "role": "assistant",
+                    "text": "Review your course page.",
+                },
+            ]
+            started = asyncio.Event()
+            finish = asyncio.Event()
+
+            async def fail_request(*_: object, **__: object) -> str:
+                started.set()
+                await finish.wait()
+                raise GroqServiceError(
+                    "Could not reach the AI service.",
+                    availability="unavailable",
+                )
+
+            with patch(
+                "app.ui.workspace.chat_about_tasks", side_effect=fail_request
+            ) as chat:
+                request = asyncio.create_task(
+                    workspace._send_chat_message("What is due?")
+                )
+                await started.wait()
+                self.assertTrue(workspace._chat_loading)
+                await workspace._send_chat_message("What is due?")
+                self.assertEqual(chat.await_count, 1)
+                finish.set()
+                await request
+
+            self.assertFalse(workspace._chat_loading)
+            self.assertEqual(
+                workspace._chat_history,
+                [
+                    {"id": "older-message", "role": "user", "text": "What is due?"},
+                    {
+                        "id": "older-response",
+                        "role": "assistant",
+                        "text": "Review your course page.",
+                    },
+                ],
+            )
+            self.assertEqual(workspace._chat_message, "What is due?")
+            self.assertIn("Could not reach", workspace._chat_error)
+            self.assertEqual(workspace._ai_availability, "unavailable")
+
+        asyncio.run(exercise())
+
+    def test_cancelled_chat_removes_only_its_pending_message(self) -> None:
+        async def exercise() -> None:
+            auth = FirebaseAuthService("test-key")
+            auth._session = fake_session("user-a")
+            workspace = StudyWorkspace(
+                FakePage(), auth, "test-project", on_unauthenticated=lambda: None
+            )
+            workspace._data_uid = "user-a"
+            workspace._data_available = True
+            workspace._chat_history = [
+                {"id": "older-message", "role": "user", "text": "Earlier question"}
+            ]
+            started = asyncio.Event()
+
+            async def wait_for_cancel(*_: object, **__: object) -> str:
+                started.set()
+                await asyncio.Event().wait()
+                return "unreachable"
+
+            with patch(
+                "app.ui.workspace.chat_about_tasks", side_effect=wait_for_cancel
+            ):
+                request = asyncio.create_task(
+                    workspace._send_chat_message("Pending question")
+                )
+                await started.wait()
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await request
+
+            self.assertFalse(workspace._chat_loading)
+            self.assertEqual(
+                workspace._chat_history,
+                [
+                    {"id": "older-message", "role": "user", "text": "Earlier question"}
+                ],
+            )
+            self.assertEqual(workspace._chat_message, "Pending question")
+
+        asyncio.run(exercise())
+
+    def test_unexpected_chat_error_is_logged_and_recovers_composer(self) -> None:
+        async def exercise() -> None:
+            auth = FirebaseAuthService("test-key")
+            auth._session = fake_session("user-a")
+            workspace = StudyWorkspace(
+                FakePage(), auth, "test-project", on_unauthenticated=lambda: None
+            )
+            workspace._data_uid = "user-a"
+            workspace._data_available = True
+            workspace._chat_history = [
+                {"id": "prior", "role": "assistant", "text": "Earlier answer"}
+            ]
+
+            with (
+                patch(
+                    "app.ui.workspace.chat_about_tasks",
+                    new_callable=AsyncMock,
+                    side_effect=ValueError("provider response parse failure"),
+                ),
+                self.assertLogs("app.ui.workspace", level="ERROR"),
+            ):
+                await workspace._send_chat_message("Current question")
+
+            self.assertFalse(workspace._chat_loading)
+            self.assertEqual(
+                workspace._chat_history,
+                [{"id": "prior", "role": "assistant", "text": "Earlier answer"}],
+            )
+            self.assertEqual(workspace._chat_message, "Current question")
+            self.assertIn("could not complete", workspace._chat_error)
+            self.assertEqual(workspace._ai_availability, "unknown")
 
         asyncio.run(exercise())
 

@@ -9,7 +9,7 @@ The repository itself verifies the following requirements:
 - Python 3.14 or newer (`pyproject.toml` declares `>=3.14`)
 - a Firebase project with Email/Password authentication enabled
 - a Firestore database for the project
-- Google AI Studio access for a Gemini API key
+- Groq API access for a local development key or backend secret
 - Node.js for Firebase rules tests and emulator commands
 - Flutter and Android SDK tooling only if the Android APK workflow is needed
 
@@ -42,11 +42,10 @@ python -m pip install -r requirements.txt
 The declared dependency versions are:
 
 - `flet>=1.0.4`
-- `google-genai>=1.0.0,<3.0.0` in `requirements.txt`
+- `httpx>=0.27,<1` for Groq API and Firebase Function requests
 - `python-dotenv>=1.0.0,<2.0.0` in `requirements.txt`
 
-`pyproject.toml` currently has stricter minimums for Google GenAI (`>=2.29.0`)
-and python-dotenv (`>=1.2.4`).
+`pyproject.toml` has stricter minimums for Flet and python-dotenv.
 
 ## 4. Environment configuration
 
@@ -55,31 +54,37 @@ Create a local `.env` file based on `.env.example`:
 ```dotenv
 FIREBASE_API_KEY=replace-with-firebase-web-api-key
 FIREBASE_PROJECT_ID=your-firebase-project-id
-GEMINI_API_KEY=replace-with-gemini-api-key
-GEMINI_MODEL=gemini-3.8-flash
-GEMINI_BACKEND_URL=direct
+GROQ_API_KEY=replace-with-groq-api-key
+GROQ_MODEL=openai/gpt-oss-20b
+AI_BACKEND_URL=direct
 ```
 
-`app/services/gemini.py` explicitly loads the repository-root `.env` file with
+`app/services/ai_config.py` explicitly loads the repository-root `.env` file with
 `python-dotenv`; `.env.example` is a template and is not loaded automatically.
 Existing process environment variables take precedence over values in `.env`.
-The current Gemini client reads:
+The Groq client uses direct API requests and reads:
 
-- `GEMINI_BACKEND_URL` to select the Cloud Function URL, or `direct` for
-  local-only calls to Google
-- `GEMINI_API_KEY` only when `GEMINI_BACKEND_URL=direct`; deployed functions
-  read the key from Firebase Secret Manager
-- `GEMINI_MODEL` for model selection (the client sends this only in direct mode;
-  deployed functions configure it server-side)
+- `AI_BACKEND_URL=direct`; direct mode is the default and only mode used by the
+  app. Firebase Cloud Functions are not called for AI requests.
+- `GROQ_API_KEY` from the root `.env` or process environment. In the Android
+  app, the user enters the key in Settings and it is saved in app-private
+  storage.
+- `GROQ_MODEL` for model selection (defaults to `openai/gpt-oss-20b`).
 
 Important notes:
 
 - `FIREBASE_API_KEY` is a web API key for the Firebase project.
 - `FIREBASE_PROJECT_ID` is the Firebase project ID, not the project display name.
-- `GEMINI_MODEL` is optional because the code falls back to `gemini-3.8-flash`.
-- In local `.env`, use `GEMINI_BACKEND_URL=direct` for local-only requests. Leave
-  it unset in packaged clients to use
-  `https://us-central1-<project>.cloudfunctions.net/generateGemini`.
+- `GROQ_MODEL` is optional because the code falls back to `openai/gpt-oss-20b`.
+- For local desktop development, put `AI_BACKEND_URL=direct` and
+  `GROQ_API_KEY=...` in the repository-root `.env`.
+- For an installed APK, do not bundle `.env` or a key. Open **Settings → Study
+  assistance**, enter the user's key, and select **Save key on this device**.
+  The app writes it to
+  `FLET_APP_STORAGE_DATA/.smart-study-task-manager/groq-config.json` inside
+  Android app-private storage.
+- `AI_BACKEND_URL` values other than `direct` are rejected; the app has no
+  Firebase Function fallback.
 - The application reads these values at runtime from environment variables and falls back to hardcoded defaults in `app/config.py`; those defaults are not a safe production configuration.
 
 ## 5. Firebase project configuration
@@ -114,9 +119,10 @@ The app writes user-scoped collections under the pattern:
 - `/users/{uid}/subjects`
 
 Task and subject documents are created under the current signed-in user’s UID,
-so there is no cross-user access in normal app flows. The deployed Cloud
-Function separately maintains a server-only `_gemini_usage` collection for AI
-rate limiting; it is not part of the client domain model.
+so there is no cross-user access in normal app flows. The deployed Cloud Function maintains server-only daily usage records in the
+legacy-named `_gemini_usage` collection. Keeping this collection name preserves
+existing per-user request counts across the provider migration; it is not part
+of the client domain model.
 
 Create the database and deploy the rules before using the app.
 
@@ -141,46 +147,25 @@ npm test
 
 This uses Firebase rules unit testing to validate the rules file in an emulator context.
 
-## 9. Gemini API configuration
+## 9. Groq API configuration
 
-For local-only development, create a Gemini API key in Google AI Studio, set
-`GEMINI_BACKEND_URL=direct` and add the key to the root `.env` file. Never
-commit or distribute this key.
+Create a Groq API key in the Groq Console. For local development, put these values in the repository-root `.env` file:
 
-The default model is `gemini-3.8-flash`, which is listed in Google's current
-[Gemini API model documentation](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash).
-Model availability, project quota, key restrictions, and network access still
-depend on the configured Google project. Sanitized application logs report the
-HTTP status category and model, but intentionally omit the API key and response
-body.
-
-The app defaults to an authenticated Firebase Cloud Function; its URL is derived
-from `FIREBASE_PROJECT_ID` and can be overridden with `GEMINI_BACKEND_URL`.
-The function verifies Firebase ID tokens, applies a per-user daily request
-limit, and keeps `GEMINI_API_KEY` in Firebase Secret Manager. The Android client
-does not need the Gemini key. Do not set `GEMINI_BACKEND_URL=direct`, bundle a
-repository `.env`, or pass the Gemini key as an APK build variable.
-
-To deploy the backend, use a Firebase project with Cloud Functions and Firestore
-enabled, install the function dependencies, set the secret, and deploy:
-
-```powershell
-Set-Location functions
-npm install
-Set-Location ..
-firebase functions:secrets:set GEMINI_API_KEY
-firebase deploy --only functions:generateGemini
+```dotenv
+AI_BACKEND_URL=direct
+GROQ_API_KEY=your-groq-api-key
+GROQ_MODEL=openai/gpt-oss-20b
 ```
 
-The deployed function defaults to `gemini-3.8-flash`. To select another model,
-set `GEMINI_MODEL` in `functions/.env` before deploying; do not put the API key
-in that file.
+`app/services/ai_config.py` loads `.env` through an absolute path anchored to the repository, so launching `python main.py` from another current directory does not change which file is read. Existing process environment values take precedence.
 
-Cloud Functions deployment requires an eligible Firebase/Google Cloud billing
-plan. The project's function service account must be able to access Firestore
-for the daily usage counter. No live deployment or Android APK has been
-validated from this repository.
+The Flet Android build bundles the Python app but does not include the repository-root `.env`. After installing the APK, enter the user's Groq key in **Settings → Study assistance → Groq API key**, then select **Save key on this device**. The app writes it to `FLET_APP_STORAGE_DATA/.smart-study-task-manager/groq-config.json` within the Android app-private directory supplied by Flet. It is read at request time; no rebuild or public shared-storage permission is needed.
 
+AI calls go directly from the client to Groq in both desktop and Android builds. The app rejects non-direct `AI_BACKEND_URL` values and does not call `generateGroq`. Cloud Functions deployment and the Firebase Blaze plan are not required for AI requests. Firebase Authentication and Firestore retain their separate project requirements for account and study-data features.
+
+The default model is `openai/gpt-oss-20b`; override it with `GROQ_MODEL`. Application errors omit the API key and provider response body.
+
+**Key warning:** A key entered in an APK remains accessible to someone who controls the device or extracts its app data. Do not ship an APK with a developer/shared key preloaded; ask each user to enter their own key. No live Groq API request or APK build is claimed as validated.
 ## 10. Desktop development startup
 
 Start the app from the repo root:
@@ -193,35 +178,28 @@ This launches the Flet page defined in `main.py` and presents the login flow if 
 
 ## 11. Android build prerequisites
 
-The repository contains a Flutter/Flet packaging layout in `build/flutter/`. That directory includes:
+The repository contains a generated Flutter/Flet packaging layout in `build/flutter/`. From the repository root, `flet build apk` regenerates the wrapper and bundles the Python application; the local `.env` file is intentionally not part of the build. The generated project includes the Android configuration and the notification plugin integration described in [docs/NOTIFICATIONS.md](./NOTIFICATIONS.md).
 
-- `pubspec.yaml`
-- Android project structure
-- `google-services.json` at the repo root (not verified as automatically wired to the build output)
-
-The build artifacts indicate Android packaging is intended, but the repo does not include a validated end-to-end APK command or CI step. The app is primarily a Python desktop/Flet app in its current source state.
-
-If Android packaging is needed, the environment should include:
-
-- Flutter SDK
-- Android SDK
-- Java toolchain
-- Android device/emulator setup or signed build configuration
+The build environment needs Flet, Flutter, the Android SDK, and a Java toolchain. The installed APK needs the user's own Groq key entered in Settings; do not add a key to build arguments, source files, or APK assets.
 
 ## 12. APK build procedure
 
-The repository does not contain a checked-in, validated APK build script. The packaging metadata in `build/flutter/pubspec.yaml` suggests a Flutter/Flet app, but the exact command has not been proven in this repo.
-
-The following is the best current guidance, not a validated build certificate:
+From the repository root, generate the Flet wrapper, apply the notification patch, and build the release APK:
 
 ```powershell
-cd build\flutter
+flet build apk
+flet-android-notifications-patch --project-root build\flutter
+Set-Location build\flutter
 flutter pub get
-flutter build apk
+flutter build apk --release --target-platform android-arm64
 ```
 
-This should be treated as a best-effort workflow until the repo’s packaging steps are explicitly validated.
+The Android settings in `pyproject.toml` produce one `arm64-v8a` APK and
+exclude development files and local credentials. This excludes 32-bit ARM and
+x86 devices; compressed native libraries reduce the sideloaded APK at the cost
+of a somewhat larger installed footprint and slower library loading.
 
+After installing, go to **Settings → Study assistance → Groq API key**, enter a key, and select **Save key on this device**. It is stored in the app-private Flet directory at `FLET_APP_STORAGE_DATA/.smart-study-task-manager/groq-config.json`; the user does not need to copy a file into the APK or rebuild it. This repository's build sequence has not been executed or validated in this session.
 ## 13. Verification commands
 
 The project’s currently verified test command is:
@@ -236,7 +214,7 @@ The Firestore security rules test is:
 npm test
 ```
 
-The Cloud Function request and Gemini error-classification tests are:
+The Cloud Function request and Groq error-classification tests are:
 
 ```powershell
 npm.cmd --prefix functions test
@@ -248,9 +226,9 @@ These are the commands that are actually supported by the checked-in code and to
 
 - The project is configured around a client-only Firebase web API usage model; this is fine for demos and local development but not a production-safe backend boundary.
 - The default Firebase API key in `app/config.py` and the default project ID are not production values.
-- The Gemini key should never be embedded in Android builds or any other shipped artifact.
-- Direct Google API requests are intended only for local development; Android
-  clients must use the authenticated Cloud Function.
+- Do not embed a developer/shared Groq key in an Android build. Android users
+  enter their own key in Settings; direct API use does not hide a key from its
+  device owner.
 
 ## 15. Troubleshooting
 
@@ -266,18 +244,15 @@ These are the commands that are actually supported by the checked-in code and to
 - deploy the rules with `firebase deploy --only firestore:rules`
 - check that the user is signed in and a valid Firebase session exists
 
-### Gemini requests fail
+### Groq requests fail
 
-- for local direct mode, set `GEMINI_BACKEND_URL=direct` and confirm `.env`
-  contains `GEMINI_API_KEY` (the app loads `.env`, not `.env.example`)
-- otherwise, verify the Firebase Cloud Function is deployed and the app's
-  Firebase project ID matches its project
-- verify the configured backend `GEMINI_MODEL` exists and is enabled
-- use the sanitized application log category/status to distinguish missing
-  configuration, key access, model, quota/rate-limit, timeout/network, and
-  upstream server failures
-- do not copy the development key to the device or APK; the Cloud Function reads
-  the deployed secret and reports sanitized failure categories in its logs
+- confirm `AI_BACKEND_URL=direct`
+- on desktop, check the repository-root `.env` contains `GROQ_API_KEY`
+- on Android, enter the key again in Settings if one has not been saved to
+  app-private storage
+- verify `GROQ_MODEL` is available to that Groq account
+- use the sanitized client error to identify key access, model, rate-limit,
+  timeout/network, or upstream server failures
 
 ### Android build fails
 

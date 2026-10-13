@@ -19,6 +19,7 @@ class TaskService:
         "category",
         "status",
         "tags",
+        "alarm_enabled",
     }
 
     def __init__(
@@ -38,6 +39,7 @@ class TaskService:
         status: str = "pending",
         tags: list[str] | None = None,
         task_id: str | None = None,
+        alarm_enabled: bool = True,
     ) -> Task:
         task = Task(
             id=task_id or "pending-id",
@@ -49,6 +51,7 @@ class TaskService:
             category=category,
             status=status,
             tags=[] if tags is None else tags,
+            alarm_enabled=alarm_enabled,
             created_at=now_utc(),
             updated_at=now_utc(),
         )
@@ -69,6 +72,7 @@ class TaskService:
             category=task.category,
             status=task.status,
             tags=task.tags,
+            alarm_enabled=task.alarm_enabled,
             created_at=task.created_at,
             updated_at=task.updated_at,
         )

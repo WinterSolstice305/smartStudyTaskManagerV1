@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock, patch
 
 import flet as ft
 
-from app.services.firestore import FirestoreError
+from app.models.task import Task
+from app.services.firestore import FirestoreDocument, FirestoreError
 from app.services.firebase_auth import AuthSession, FirebaseAuthService
 from app.services.study_cache import StudyCache
 from app.ui.theme import DARK, LIGHT, apply_theme, load_dark_mode, save_dark_mode
@@ -46,6 +47,11 @@ class FakePage:
 class WorkspaceUiTests(unittest.TestCase):
     def setUp(self) -> None:
         self._cache_directory = tempfile.TemporaryDirectory()
+        self._preferences_patch = patch(
+            "app.ui.theme._preferences_path",
+            return_value=Path(self._cache_directory.name) / "preferences.json",
+        )
+        self._preferences_patch.start()
         self.page = FakePage()
         self.workspace = StudyWorkspace(
             self.page,  # type: ignore[arg-type]
@@ -58,6 +64,7 @@ class WorkspaceUiTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self._preferences_patch.stop()
         self._cache_directory.cleanup()
 
     @staticmethod
@@ -116,6 +123,457 @@ class WorkspaceUiTests(unittest.TestCase):
                 self.workspace.route = route
                 screen = self.workspace._build_screen(session)
                 self.assertIsInstance(screen, ft.Control)
+
+    def test_chat_templates_submit_their_predefined_prompts(self) -> None:
+        self.workspace.auth._session = AuthSession(
+            uid="user",
+            email="student@example.com",
+            id_token="token",
+            refresh_token="refresh-token",
+            expires_in="3600",
+        )
+        self.workspace._data_available = True
+        self.workspace._data_uid = "user"
+        screen = self.workspace._chatbot_screen()
+        if not isinstance(screen, ft.Column):
+            self.fail("Assistant screen must be a column.")
+        suggestions_panel = screen.controls[1]
+        if not isinstance(suggestions_panel, ft.Container):
+            self.fail("Suggested prompts must be in a container.")
+        if not isinstance(suggestions_panel.content, ft.Column):
+            self.fail("Suggested prompts must be arranged in a column.")
+        suggestion_row = suggestions_panel.content.controls[1]
+        if not isinstance(suggestion_row, ft.Row):
+            self.fail("Suggested prompts must be arranged in a row.")
+
+        with patch.object(self.page, "run_task") as run_task:
+            for prompt, button in zip(
+                self.workspace._chat_suggestions, suggestion_row.controls
+            ):
+                self.assertIsInstance(button, ft.TextButton)
+                if not isinstance(button, ft.TextButton):
+                    self.fail("Each suggested prompt must be a text button.")
+                self.assertFalse(button.disabled)
+                button.on_click(None)
+                run_task.assert_called_with(self.workspace._send_chat_message, prompt)
+                run_task.reset_mock()
+
+    def test_chat_bubbles_fit_their_text_and_keep_speaker_alignment(self) -> None:
+        for speaker, expected_alignment in (
+            ("user", ft.MainAxisAlignment.END),
+            ("assistant", ft.MainAxisAlignment.START),
+        ):
+            with self.subTest(speaker=speaker):
+                bubble_row = self.workspace._chat_bubble(
+                    speaker, "A short chat message."
+                )
+                self.assertIsInstance(bubble_row, ft.Container)
+                if not isinstance(bubble_row, ft.Container):
+                    self.fail("Each chat message must be contained.")
+                self.assertIsNone(bubble_row.height)
+                self.assertIsNone(bubble_row.alignment)
+                self.assertIsNone(bubble_row.width)
+                self.assertTrue(bubble_row.expand)
+                self.assertIsInstance(bubble_row.content, ft.Row)
+                if not isinstance(bubble_row.content, ft.Row):
+                    self.fail("Speaker alignment must be provided by a row.")
+                self.assertEqual(bubble_row.content.alignment, expected_alignment)
+                self.assertTrue(bubble_row.content.expand)
+
+                message = bubble_row.content.controls[0]
+                self.assertIsInstance(message, ft.Column)
+                if not isinstance(message, ft.Column):
+                    self.fail("A chat message must contain a label and bubble.")
+                self.assertTrue(message.expand)
+                message_bubble = message.controls[1]
+                self.assertIsInstance(message_bubble, ft.Container)
+                if not isinstance(message_bubble, ft.Container):
+                    self.fail("The message text must be inside a bubble.")
+                self.assertIsNone(message_bubble.height)
+                self.assertIsNone(message_bubble.expand)
+                self.assertIsNone(message_bubble.alignment)
+                self.assertIsNone(message_bubble.width)
+                self.assertEqual(message_bubble.padding, 12)
+                if speaker == "user":
+                    self.assertIsInstance(message_bubble.content, ft.Text)
+                    if not isinstance(message_bubble.content, ft.Text):
+                        self.fail("User messages must remain plain text.")
+                    self.assertEqual(message_bubble.content.value, "A short chat message.")
+                    self.assertIsNone(message_bubble.content.max_lines)
+                    self.assertFalse(message_bubble.content.no_wrap)
+                else:
+                    self.assertIsInstance(message_bubble.content, ft.Markdown)
+                    if not isinstance(message_bubble.content, ft.Markdown):
+                        self.fail("Assistant messages must use Markdown rendering.")
+                    self.assertEqual(
+                        message_bubble.content.value, "A short chat message."
+                    )
+                    self.assertEqual(
+                        message_bubble.content.extension_set,
+                        ft.MarkdownExtensionSet.GITHUB_WEB,
+                    )
+                    self.assertTrue(message_bubble.content.selectable)
+                    self.assertFalse(message_bubble.content.auto_follow_links)
+                    self.assertIsNotNone(message_bubble.content.on_tap_link)
+                    self.assertFalse(message_bubble.content.shrink_wrap)
+                    self.assertFalse(message_bubble.content.fit_content)
+                    self.assertIsNone(message_bubble.content.height)
+                    self.assertIsNone(message_bubble.content.expand)
+
+    def test_assistant_markdown_creation_failure_falls_back_to_original_text(self) -> None:
+        response = "# Study plan\n\n- Review **Data Structures**"
+        with self.assertLogs("app.ui.workspace", level="ERROR"):
+            with patch(
+                "app.ui.workspace.ft.Markdown", side_effect=ValueError("invalid")
+            ):
+                bubble_row = self.workspace._chat_bubble("assistant", response)
+
+        if not isinstance(bubble_row.content, ft.Row):
+            self.fail("The assistant message must keep its row layout.")
+        message = bubble_row.content.controls[0]
+        if not isinstance(message, ft.Column):
+            self.fail("The assistant message must keep its bubble layout.")
+        bubble = message.controls[1]
+        if not isinstance(bubble, ft.Container):
+            self.fail("The assistant response must remain inside a bubble.")
+        self.assertIsInstance(bubble.content, ft.Text)
+        if not isinstance(bubble.content, ft.Text):
+            self.fail("Markdown failures must fall back to plain text.")
+        self.assertEqual(bubble.content.value, response)
+
+    def test_assistant_markdown_links_only_open_safe_web_urls(self) -> None:
+        bubble_row = self.workspace._chat_bubble("assistant", "See [this link](url).")
+        if not isinstance(bubble_row.content, ft.Row):
+            self.fail("The assistant message must keep its row layout.")
+        message = bubble_row.content.controls[0]
+        if not isinstance(message, ft.Column):
+            self.fail("The assistant message must keep its bubble layout.")
+        bubble = message.controls[1]
+        if not isinstance(bubble, ft.Container) or not isinstance(
+            bubble.content, ft.Markdown
+        ):
+            self.fail("Assistant messages must use Markdown rendering.")
+        self.assertEqual(
+            bubble.content.on_tap_link, self.workspace._open_chat_markdown_link
+        )
+
+        with patch.object(self.page, "run_task") as run_task:
+            self.workspace._open_chat_markdown_link(
+                SimpleNamespace(data="https://example.com/path")
+            )
+            run_task.assert_called_once()
+            self.assertEqual(run_task.call_args.args[0].__name__, "launch_url")
+            self.assertEqual(
+                run_task.call_args.args[1], "https://example.com/path"
+            )
+
+            run_task.reset_mock()
+            with self.assertLogs("app.ui.workspace", level="WARNING"):
+                self.workspace._open_chat_markdown_link(
+                    SimpleNamespace(data="javascript:alert(1)")
+                )
+            run_task.assert_not_called()
+
+    def test_chat_conversation_expands_and_auto_scrolls(self) -> None:
+        self.workspace.auth._session = AuthSession(
+            uid="user",
+            email="student@example.com",
+            id_token="token",
+            refresh_token="refresh-token",
+            expires_in="3600",
+        )
+        self.workspace._chat_history = [
+            {"role": "user", "text": "Hello"},
+            {"role": "assistant", "text": "How can I help?"},
+        ]
+
+        screen = self.workspace._chatbot_screen()
+        self.assertIsInstance(screen, ft.Column)
+        if not isinstance(screen, ft.Column):
+            self.fail("Assistant screen must be a column.")
+        messages = screen.controls[2]
+        self.assertIsInstance(messages, ft.ListView)
+        if not isinstance(messages, ft.ListView):
+            self.fail("Conversation messages must use a list view.")
+        self.assertTrue(messages.expand)
+        self.assertTrue(messages.auto_scroll)
+
+    def test_task_alarm_checkbox_defaults_on_and_preserves_saved_value(self) -> None:
+        self.workspace._show_task_dialog()
+        dialog = self.page.dialog
+        self.assertIsInstance(dialog, ft.AlertDialog)
+        if not isinstance(dialog, ft.AlertDialog):
+            self.fail("Task form should open in an alert dialog.")
+        self.assertIsInstance(dialog.content, ft.Column)
+        if not isinstance(dialog.content, ft.Column):
+            self.fail("Task form content should be a column.")
+        checkbox = next(
+            control
+            for control in dialog.content.controls
+            if isinstance(control, ft.Checkbox)
+        )
+        self.assertEqual(checkbox.label, "Alarm at due time")
+        self.assertTrue(checkbox.value)
+
+        task = Task(
+            "task-1",
+            "Existing task",
+            None,
+            alarm_enabled=False,
+        )
+        self.workspace._show_task_dialog(task)
+        dialog = self.page.dialog
+        if not isinstance(dialog, ft.AlertDialog) or not isinstance(
+            dialog.content, ft.Column
+        ):
+            self.fail("Editing a task should retain the task form.")
+        checkbox = next(
+            control
+            for control in dialog.content.controls
+            if isinstance(control, ft.Checkbox)
+        )
+        self.assertFalse(checkbox.value)
+
+    def test_new_account_premade_tasks_are_persisted_once(self) -> None:
+        async def exercise() -> None:
+            self.workspace.auth._session_path = (
+                Path(self._cache_directory.name) / "session.json"
+            )
+            session = AuthSession(
+                uid="new-user",
+                email="student@example.com",
+                id_token="token",
+                refresh_token="refresh-token",
+                expires_in="3600",
+                is_new_account=True,
+            )
+            self.workspace.auth._session = session
+            self.workspace.firestore.read_document = AsyncMock(return_value=None)
+            self.workspace.firestore.create_document = AsyncMock(
+                return_value="premade_tasks_v1"
+            )
+            self.workspace.tasks.get_task = AsyncMock(return_value=None)
+
+            async def create_task(**values: Any) -> Task:
+                return Task(
+                    id=values["task_id"],
+                    title=values["title"],
+                    deadline=values["deadline"],
+                    description=values["description"],
+                    priority=values["priority"],
+                    category=values["category"],
+                    status=values["status"],
+                    alarm_enabled=values["alarm_enabled"],
+                )
+
+            self.workspace.tasks.create_task = AsyncMock(side_effect=create_task)
+            seeded = await self.workspace._seed_premade_example_tasks(session)
+
+            self.assertEqual(
+                [task.title for task in seeded],
+                ["Review Data Structures", "Finish Research Paper"],
+            )
+            self.assertEqual(
+                [task.description for task in seeded],
+                [
+                    "Review stacks, queues, and trees. Solve at least five practice problems.",
+                    "Complete the introduction and methodology sections, then review the draft.",
+                ],
+            )
+            self.assertTrue(all(task.deadline is None for task in seeded))
+            self.assertTrue(all(not task.alarm_enabled for task in seeded))
+            self.assertEqual(
+                [task.category for task in seeded], ["Study", "Assignment"]
+            )
+            self.workspace.firestore.create_document.assert_awaited_once_with(
+                "workspace_metadata",
+                {"premade_tasks_seeded": True},
+                document_id="premade_tasks_v1",
+            )
+            current_session = self.workspace.auth.session
+            assert current_session is not None
+            self.assertFalse(current_session.is_new_account)
+
+            self.workspace.auth._session = AuthSession(
+                uid="new-user",
+                email="student@example.com",
+                id_token="token",
+                refresh_token="refresh-token",
+                expires_in="3600",
+                is_new_account=True,
+            )
+            self.workspace.firestore.read_document = AsyncMock(
+                return_value=FirestoreDocument(
+                    "premade_tasks_v1", {"premade_tasks_seeded": True}
+                )
+            )
+            self.workspace.tasks.get_task.reset_mock()
+            self.workspace.tasks.create_task.reset_mock()
+
+            self.assertEqual(
+                await self.workspace._seed_premade_example_tasks(session), []
+            )
+            self.workspace.tasks.get_task.assert_not_awaited()
+            self.workspace.tasks.create_task.assert_not_awaited()
+            self.workspace.firestore.create_document.assert_awaited_once()
+            current_session = self.workspace.auth.session
+            assert current_session is not None
+            self.assertFalse(current_session.is_new_account)
+
+        asyncio.run(exercise())
+
+    def test_premade_task_retry_reuses_tasks_created_before_failure(self) -> None:
+        async def exercise() -> None:
+            session = AuthSession(
+                uid="new-user",
+                email="student@example.com",
+                id_token="token",
+                refresh_token="refresh-token",
+                expires_in="3600",
+                is_new_account=True,
+            )
+            self.workspace.auth._session = session
+            existing = Task(
+                id="premade-review-data-structures",
+                title="Review Data Structures",
+                deadline=None,
+                description=(
+                    "Review stacks, queues, and trees. Solve at least five "
+                    "practice problems."
+                ),
+                priority="medium",
+                category="Study",
+                alarm_enabled=False,
+            )
+            self.workspace.firestore.read_document = AsyncMock(return_value=None)
+            self.workspace.firestore.create_document = AsyncMock(
+                return_value="premade_tasks_v1"
+            )
+            self.workspace.tasks.get_task = AsyncMock(
+                side_effect=[existing, None]
+            )
+            self.workspace.tasks.create_task = AsyncMock(
+                return_value=Task(
+                    id="premade-finish-research-paper",
+                    title="Finish Research Paper",
+                    deadline=None,
+                    priority="high",
+                    category="Assignment",
+                    alarm_enabled=False,
+                )
+            )
+
+            seeded = await self.workspace._seed_premade_example_tasks(session)
+
+            self.assertEqual(len(seeded), 2)
+            self.workspace.tasks.create_task.assert_awaited_once()
+            task_call = self.workspace.tasks.create_task.await_args
+            assert task_call is not None
+            self.assertEqual(task_call.kwargs["task_id"], "premade-finish-research-paper")
+            self.workspace.firestore.create_document.assert_awaited_once()
+
+        asyncio.run(exercise())
+
+    def test_chat_availability_and_sending_states_are_visible(self) -> None:
+        self.workspace.auth._session = AuthSession(
+            uid="user",
+            email="student@example.com",
+            id_token="token",
+            refresh_token="refresh-token",
+            expires_in="3600",
+        )
+        self.workspace._data_available = True
+        self.workspace._data_uid = "user"
+        screen = self.workspace._chatbot_screen()
+        if not isinstance(screen, ft.Column):
+            self.fail("Assistant screen must be a column.")
+        header = screen.controls[0]
+        if not isinstance(header, ft.Row) or not isinstance(
+            header.controls[1], ft.Column
+        ):
+            self.fail("Assistant title must include its status indicator.")
+        availability = header.controls[1].controls[2]
+        self.assertIsInstance(availability, ft.Row)
+        if not isinstance(availability, ft.Row):
+            self.fail("AI availability must be shown in a row.")
+        self.assertEqual(
+            availability.controls[1].value, "AI availability not checked"
+        )
+
+        self.workspace._ai_availability = "unavailable"
+        self.workspace._chat_loading = True
+        screen = self.workspace._chatbot_screen()
+        if not isinstance(screen, ft.Column):
+            self.fail("Assistant screen must be a column.")
+        header = screen.controls[0]
+        if not isinstance(header, ft.Row) or not isinstance(
+            header.controls[1], ft.Column
+        ):
+            self.fail("Assistant title must include its status indicator.")
+        availability = header.controls[1].controls[2]
+        self.assertIsInstance(availability, ft.Row)
+        if not isinstance(availability, ft.Row):
+            self.fail("AI availability must be shown in a row.")
+        self.assertEqual(
+            availability.controls[1].value, "Reconnecting to AI service…"
+        )
+        composer = screen.controls[3]
+        if not isinstance(composer, ft.Row):
+            self.fail("Message composer must be a row.")
+        text_field = composer.controls[0]
+        self.assertIsInstance(text_field, ft.TextField)
+        if not isinstance(text_field, ft.TextField):
+            self.fail("Composer must include a text field.")
+        self.assertTrue(text_field.disabled)
+        send_button = composer.controls[1]
+        self.assertIsInstance(send_button, ft.Button)
+        if not isinstance(send_button, ft.Button):
+            self.fail("Composer must include a send button.")
+        self.assertIsInstance(send_button.content, ft.ProgressRing)
+        self.assertTrue(send_button.disabled)
+        self.assertEqual(send_button.width, 96)
+        self.assertEqual(send_button.height, 48)
+
+    def test_chat_composer_updates_send_state_and_uses_current_message(self) -> None:
+        self.workspace.auth._session = AuthSession(
+            uid="user",
+            email="student@example.com",
+            id_token="token",
+            refresh_token="refresh-token",
+            expires_in="3600",
+        )
+        self.workspace._data_available = True
+        self.workspace._data_uid = "user"
+        screen = self.workspace._chatbot_screen()
+        if not isinstance(screen, ft.Column):
+            self.fail("Assistant screen must be a column.")
+        composer = screen.controls[3]
+        if not isinstance(composer, ft.Row):
+            self.fail("Message composer must be a row.")
+        text_field, send_button = composer.controls
+        self.assertIsInstance(text_field, ft.TextField)
+        self.assertIsInstance(send_button, ft.Button)
+        if not isinstance(text_field, ft.TextField) or not isinstance(
+            send_button, ft.Button
+        ):
+            self.fail("Composer must contain a text field and send button.")
+        self.assertEqual(send_button.width, 96)
+        self.assertEqual(send_button.height, 48)
+
+        text_field.on_change(
+            SimpleNamespace(control=SimpleNamespace(value="Review chapter 3"))
+        )
+        self.assertEqual(self.workspace._chat_message, "Review chapter 3")
+        self.assertFalse(send_button.disabled)
+
+        with patch.object(self.page, "run_task") as run_task:
+            send_button.on_click(None)
+            run_task.assert_called_once_with(
+                self.workspace._send_chat_message, "Review chapter 3"
+            )
+
+        text_field.on_change(SimpleNamespace(control=SimpleNamespace(value="   ")))
+        self.assertTrue(send_button.disabled)
 
     def test_navigation_bar_is_safe_area_aware_and_centered(self) -> None:
         navigation = self.workspace._navigation_bar()
@@ -434,6 +892,42 @@ class WorkspaceUiTests(unittest.TestCase):
             self.assertIsInstance(self.page.controls[0], ft.Column)
 
         asyncio.run(exercise())
+
+    def test_scrollable_pages_attach_pull_to_refresh_handlers(self) -> None:
+        session = AuthSession(
+            uid="user",
+            email="student@example.com",
+            id_token="token",
+            refresh_token="refresh-token",
+            expires_in="3600",
+        )
+        self.workspace.auth._session = session
+        self.workspace.route = "tasks"
+        screen = self.workspace._build_screen(session)
+        self.assertIsInstance(screen, ft.ListView)
+        self.assertTrue(callable(getattr(screen, "on_scroll", None)))
+
+        self.workspace._pull_refresh_distance = 60
+        indicator = self.workspace._pull_refresh_indicator()
+        self.assertEqual(indicator.height, 48)
+
+    def test_safe_cache_cleanup_preserves_unrelated_user_snapshots(self) -> None:
+        self.workspace.auth._session = AuthSession(
+            uid="user",
+            email="student@example.com",
+            id_token="token",
+            refresh_token="refresh-token",
+            expires_in="3600",
+        )
+        self.workspace._study_cache.save("user", [], [])
+        self.workspace._study_cache.save("guest", [], [])
+        self.workspace._study_cache.save("other-user", [], [])
+
+        self.workspace._safe_disposable_cache_cleanup(uid="user")
+
+        self.assertIsNone(self.workspace._study_cache.load("user"))
+        self.assertIsNone(self.workspace._study_cache.load("guest"))
+        self.assertIsNotNone(self.workspace._study_cache.load("other-user"))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 # Firebase and security
 
 The application uses Firebase Authentication and Firestore directly from the
-client. It also includes a narrowly scoped Firebase Cloud Function for Gemini
-requests. Task and subject data access is still mediated by the client’s
-Firebase session and Firestore security rules.
+client. Groq AI requests are also sent directly from the client; they do not
+require Firebase Cloud Functions. Task and subject data access is still
+mediated by the client’s Firebase session and Firestore security rules.
 
 ## Authentication mechanism
 
@@ -65,7 +65,7 @@ Token using the locally saved refresh token. It does not implement background
 token-refresh scheduling or server-side verification in the desktop client.
 
 The Cloud Function verifies the bearer ID token server-side before it accepts a
-Gemini request.
+Groq request.
 
 This means the app relies on Firebase being reachable and the session staying current while the client remains active.
 
@@ -99,21 +99,26 @@ Examples:
 
 This means user A cannot access user B’s documents unless Firebase rules are bypassed.
 
-## Gemini Cloud Function boundary
+## Optional Groq Cloud Function proxy
 
-`functions/index.js` exports `generateGemini`, an HTTPS function in
+`functions/index.js` contains an optional `generateGroq` HTTPS proxy in
 `us-central1`. It accepts only POST requests with a Firebase bearer token,
-validates bounded prompt/configuration fields, and reads `GEMINI_API_KEY` from
-Firebase Secret Manager. The key is never returned to the client.
+validates bounded prompt/configuration fields, and reads `GROQ_API_KEY` from
+Firebase Secret Manager. The app's Python AI client does not call this
+function; AI use does not require Cloud Functions or the Blaze plan.
 
 The function uses the Admin SDK to maintain `_gemini_usage/{base64url(uid)}`
-records with the UTC day, count, and server timestamp. It permits at most 30
-accepted Gemini requests per user per UTC day. This server-managed collection
-is not task/subject data and is not accessed by the client Firestore service.
+records with the UTC day, count, and server timestamp. The legacy collection
+name is intentionally retained so migration does not reset existing per-user
+limits. It permits at most 30 accepted AI requests per user per UTC day. This
+server-managed collection is not task/subject data and is not accessed by the
+client Firestore service.
 
-`GEMINI_BACKEND_URL=direct` bypasses this protection for local development and
-requires a local Gemini key. It must not be used for distributed clients or
-Android packages.
+The app sets `AI_BACKEND_URL=direct` for local and Android use. On desktop,
+the key is read from repository-root `.env`; in Android, the user enters it in
+Settings and it is saved under Flet's app-private storage directory. Direct
+client mode means each key is exposed to the device owner; do not preload or
+distribute a developer/shared key in an APK.
 
 ## Security rules
 
@@ -219,12 +224,12 @@ This uses Firebase rules unit testing and the repo’s `firestore.rules` file to
 This project is client-driven and therefore has important caveats:
 
 - the Firebase API key is embedded in the client runtime model
-- task and subject access has no general-purpose backend layer; Gemini calls do
-  have a dedicated authenticated function boundary
+- task and subject access has no general-purpose backend layer; Groq AI calls
+  are direct from the client
 - security relies on Firestore rules and the authenticated user’s UID
 - the locally saved refresh token and study-data cache rely on the operating
   system's protection of the user profile directory
-- direct Gemini mode exposes the Gemini key to that local client and must not
-  be used in distributed Android builds
+- direct Groq mode exposes the Groq key to the device owner. APK users should
+  enter their own key; never ship a developer/shared key inside an APK.
 
 These are not new vulnerabilities in the code itself, but they are meaningful design constraints for production readiness.

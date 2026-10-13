@@ -8,5 +8,6 @@ This folder contains the repository’s implementation-focused technical documen
 - [SETUP.md](./SETUP.md) — installation, environment variables, and local setup
 - [DATA_MODEL.md](./DATA_MODEL.md) — `Subject` and `Task` schema, relationships, and Firestore structure
 - [FIREBASE_AND_SECURITY.md](./FIREBASE_AND_SECURITY.md) — Firebase auth, Firestore rules, and security model
+- [NOTIFICATIONS.md](./NOTIFICATIONS.md) — Android-local task reminders, deadline alarms, and delivery limitations
 
 The documentation in this folder follows the repository’s actual code and test behavior rather than the original project proposal or aspirational feature list.

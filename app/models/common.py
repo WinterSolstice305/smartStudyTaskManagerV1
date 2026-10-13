@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any
 
 from app.models import ModelValidationError
@@ -30,6 +30,23 @@ def parse_datetime(value: Any, field: str) -> datetime:
 def parse_optional_datetime(value: Any, field: str) -> datetime | None:
     if value is None or value == "":
         return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime.combine(value, time(23, 59)).astimezone(timezone.utc)
+    if isinstance(value, str):
+        try:
+            return parse_datetime(value, field)
+        except ModelValidationError:
+            # Older task records may contain a date-only deadline. Preserve
+            # the former end-of-day semantics in the device's local timezone.
+            try:
+                legacy_date = date.fromisoformat(value)
+            except ValueError as error:
+                raise ModelValidationError(
+                    f"{field} must be an ISO-8601 date and time."
+                ) from error
+            return datetime.combine(legacy_date, time(23, 59)).astimezone(
+                timezone.utc
+            )
     return parse_datetime(value, field)
 
 

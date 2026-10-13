@@ -53,20 +53,64 @@ function validatePayload(body) {
   };
 }
 
-function classifyGeminiError(error) {
-  const status = Number(error?.status ?? error?.code);
+function toGroqJsonSchema(schema) {
+  if (Array.isArray(schema)) {
+    return schema.map(toGroqJsonSchema);
+  }
+  if (!schema || typeof schema !== "object") {
+    return schema;
+  }
+  const converted = Object.fromEntries(
+    Object.entries(schema)
+      .filter(([key]) => key !== "type")
+      .map(([key, value]) => [key, toGroqJsonSchema(value)]),
+  );
+  if (typeof schema.type === "string") {
+    converted.type = schema.type.toLowerCase();
+  }
+  if (converted.type === "object") {
+    converted.additionalProperties = false;
+  }
+  return converted;
+}
+
+function groqPayload(input, model) {
+  const payload = {
+    model,
+    messages: [
+      { role: "system", content: input.systemInstruction },
+      { role: "user", content: input.prompt },
+    ],
+    max_completion_tokens: input.maxOutputTokens,
+    temperature: 0.2,
+  };
+  if (input.responseSchema) {
+    payload.response_format = {
+      type: "json_schema",
+      json_schema: {
+        name: "task_recommendations",
+        strict: true,
+        schema: toGroqJsonSchema(input.responseSchema),
+      },
+    };
+  }
+  return payload;
+}
+
+function classifyGroqError(error) {
+  const status = Number(error?.status ?? error?.statusCode ?? error?.code);
   if (status === 429) {
     return {
       status: 429,
-      code: "GEMINI_RATE_LIMIT",
+      code: "GROQ_RATE_LIMIT",
       category: "quota_or_rate_limit",
-      message: "Gemini quota or rate limit reached. Wait a moment and retry.",
+      message: "Groq quota or rate limit reached. Wait a moment and retry.",
     };
   }
   if (status === 401 || status === 403) {
     return {
       status: 502,
-      code: "GEMINI_AUTH",
+      code: "GROQ_AUTH",
       category: "authentication_or_access",
       message: "The AI service credentials were rejected.",
     };
@@ -74,57 +118,53 @@ function classifyGeminiError(error) {
   if (status === 404) {
     return {
       status: 502,
-      code: "GEMINI_MODEL",
+      code: "GROQ_MODEL",
       category: "model_not_found",
-      message: "The configured Gemini model is unavailable.",
+      message: "The configured Groq model is unavailable.",
     };
   }
   if (status === 400) {
     return {
       status: 400,
-      code: "GEMINI_INVALID",
+      code: "GROQ_INVALID",
       category: "invalid_request",
-      message: "Gemini could not process this request.",
-    };
-  }
-  if (status === 408 || status === 504) {
-    return {
-      status: 504,
-      code: "GEMINI_TIMEOUT",
-      category: "network_timeout",
-      message: "Gemini took too long to respond. Please retry.",
-    };
-  }
-  if (Number.isInteger(status) && status >= 500) {
-    return {
-      status: 502,
-      code: "GEMINI_UNAVAILABLE",
-      category: "upstream_server",
-      message: "Gemini is temporarily unavailable. Please try again later.",
+      message: "Groq could not process this request.",
     };
   }
   if (
+    status === 408 ||
+    status === 504 ||
     error?.name === "TimeoutError" ||
     error?.name === "AbortError"
   ) {
     return {
       status: 504,
-      code: "GEMINI_TIMEOUT",
+      code: "GROQ_TIMEOUT",
       category: "network_timeout",
-      message: "Gemini took too long to respond. Please retry.",
+      message: "The AI service took too long to respond. Please retry.",
+    };
+  }
+  if (Number.isInteger(status) && status >= 500) {
+    return {
+      status: 502,
+      code: "GROQ_UNAVAILABLE",
+      category: "upstream_server",
+      message: "Groq is temporarily unavailable. Please try again later.",
     };
   }
   return {
     status: 503,
-    code: "GEMINI_NETWORK",
+    code: "GROQ_NETWORK",
     category: "network_failure",
-    message: "Could not reach Gemini. Check your connection and retry.",
+    message: "Could not reach Groq. Check your connection and retry.",
   };
 }
 
 module.exports = {
   MAX_OUTPUT_TOKENS,
   RequestError,
-  classifyGeminiError,
+  classifyGroqError,
+  groqPayload,
+  toGroqJsonSchema,
   validatePayload,
 };

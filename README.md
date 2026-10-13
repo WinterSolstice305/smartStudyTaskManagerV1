@@ -10,30 +10,29 @@ Implemented and covered by repository tests:
 - Firestore REST API integration with user-scoped document paths
 - subject CRUD and task CRUD
 - task filtering, sorting, and calendar helpers
-- AI recommendations and study-planning chat using Gemini
+- AI recommendations and study-planning chat using Groq
 - a responsive monthly calendar, calendar-based optional task deadlines, and
   collapsible task filters
 - light and dark appearance settings with a locally persisted theme preference
 - visible loading, slow-network status, retry feedback, and startup/data-load logs
 - Firebase security rules and rules-unit testing
+- pull-to-refresh support for the Home, Tasks, and Calendar screens using Flet scroll overscroll events and a safe study-cache cleanup guard that clears only the disposable local snapshot cache
 
 Partially implemented or unverified live workflow:
 
 - Android APK build path (`build/flutter`) is present but not validated by a checked-in build script
-- Gemini API calls are implemented and unit-tested with mocks, but live calls are not verified in this repo
-- Firebase Authentication and Firestore data access remain client-side; Gemini
-  requests use an authenticated Firebase Cloud Function
+- Local development and packaged APKs call Groq directly. Android users enter
+  their own key in Settings; no Firebase Cloud Function is required for AI.
 
 ## Technology stack
 
 - Python: `>=3.14` (`pyproject.toml`)
 - Flet: `>=1.0.4` in `requirements.txt` and `pyproject.toml`; Android wrapper uses `1.0.4`
-- Google GenAI: `google-genai>=2.29.0` in `pyproject.toml`; the `requirements.txt`
-  install path allows `>=1.0.0,<3.0.0`
+- HTTPX: `httpx>=0.27,<1` for direct Groq Chat Completions calls
 - Python dotenv: `python-dotenv>=1.2.4` in `pyproject.toml`; the
   `requirements.txt` install path allows `>=1.0.0,<2.0.0`
 - Firebase Authentication + Firestore REST API
-- Gemini API for AI recommendations/chat
+- Groq API for AI recommendations/chat
 - Firebase rules-unit testing for security validation
 
 ## Prerequisites
@@ -41,7 +40,7 @@ Partially implemented or unverified live workflow:
 - Python 3.14+
 - A Firebase project with Email/Password auth enabled
 - A Firestore database for the project
-- A Gemini API key from Google AI Studio
+- A Groq API key for local development and AI use in an installed APK
 - Node.js for Firebase rules tests
 - Flutter/Android SDK only for APK packaging work
 
@@ -60,9 +59,9 @@ Then populate your local `.env` file with real values, not placeholders:
 ```dotenv
 FIREBASE_API_KEY=your-firebase-web-api-key
 FIREBASE_PROJECT_ID=your-firebase-project-id
-GEMINI_API_KEY=your-gemini-key
-GEMINI_MODEL=gemini-3.8-flash
-GEMINI_BACKEND_URL=direct
+GROQ_API_KEY=your-groq-key
+GROQ_MODEL=openai/gpt-oss-20b
+AI_BACKEND_URL=direct
 ```
 
 ## Environment and configuration
@@ -71,11 +70,12 @@ The application expects the following runtime values:
 
 - `FIREBASE_API_KEY`
 - `FIREBASE_PROJECT_ID`
-- `GEMINI_API_KEY` only for local direct mode; deployed requests use the
-  Firebase function secret
-- `GEMINI_MODEL` (optional; defaults to `gemini-3.8-flash`)
-- `GEMINI_BACKEND_URL` (optional; defaults to the Firebase Cloud Function
-  derived from `FIREBASE_PROJECT_ID`; set to `direct` only for local development)
+- `GROQ_API_KEY` for local development; never commit or package this key
+- `GROQ_MODEL` (optional; defaults to `openai/gpt-oss-20b`)
+- `AI_BACKEND_URL=direct` selects the direct Groq API. Direct mode is the
+  default and only AI mode supported by the app.
+- On Android, configure a key in **Settings → Study assistance → Groq API
+  key**; it is stored in the app-private data directory.
 
 See `.env.example` for the sanitized template, and see [docs/SETUP.md](./docs/SETUP.md) for setup details.
 
@@ -109,21 +109,28 @@ npm.cmd --prefix functions test
 
 ## Android build
 
-The repository contains a Flutter/Flet packaging layout under `build/flutter`, but there is no checked-in, validated Android APK script that is proven end-to-end in this repo. The packaging path is present and indicates intent, but it is not a confirmed, fully verified build workflow.
+The Flet Android build configuration targets one `arm64-v8a` APK, excludes development-only files, and uses compressed native-library packaging to reduce the sideloaded APK size. This excludes 32-bit ARM and x86 devices; legacy native packaging can increase installed size and library load time.
 
-Best-effort guidance:
+From the repository root, generate the Android wrapper and then build the APK:
 
 ```powershell
-cd build\flutter
+flet build apk
+flet-android-notifications-patch --project-root build\flutter
+Set-Location build\flutter
 flutter pub get
-flutter build apk
+flutter build apk --release --target-platform android-arm64
 ```
 
-Treat this as a development-stage command until the project’s Android workflow is locally validated.
+The project has a Flet-generated wrapper and notification patch step; the APK
+workflow has not been validated end to end. After installing
+the APK, open **Settings → Study assistance**, enter the user's Groq API key,
+and save it on that device. The key is written to the app-private file
+`FLET_APP_STORAGE_DATA/.smart-study-task-manager/groq-config.json`; Android does
+not expose this directory as a regular Downloads folder.
 
-Do not include a local `.env` containing `GEMINI_API_KEY` in an APK. Packaged
-clients should use the authenticated Cloud Function; the direct mode is for
-local development only.
+Do not include `.env` or a key in APK assets or source. A user-supplied key is
+still extractable by someone with control of that device or APK runtime, so
+distribute only builds that ask each user to supply their own key.
 
 ## Documentation index
 
@@ -145,11 +152,11 @@ local development only.
 - The app stores data under `/users/{uid}/...`, so user isolation is enforced by Firestore rules, not by a separate backend.
 - The default Firebase API key and project ID in source are demo configuration,
   not a production configuration.
-- Gemini requests default to an authenticated Firebase Cloud Function with a
-  per-user daily request limit. For local-only development, `GEMINI_BACKEND_URL=direct`
-  opts into direct Google API requests using `GEMINI_API_KEY`. Never set that mode
-  or bundle the private key in an Android APK.
-- The repository currently validates behavior with unit tests and Firebase rule tests, but the live Gemini API and Android APK build are not fully validated in a production-like environment.
+- Groq requests go directly from the client to the Groq API. Firebase Cloud
+  Functions and Blaze billing are not required for AI requests. Each client
+  supplies its own key, which is not a server-side secret once entered in an
+  APK.
+- The repository currently validates behavior with unit tests and Firebase rule tests; the live Groq API and Android APK build are not validated in a production-like environment.
 
 ## Troubleshooting
 
@@ -165,12 +172,11 @@ If Firestore fails, confirm:
 - the security rules were deployed
 - the current user is authenticated and has the correct UID-scoped path
 
-If Gemini requests fail, confirm:
+If Groq requests fail, confirm:
 
-- a trusted function is deployed for the Firebase project, or use
-  `GEMINI_BACKEND_URL=direct` for local-only development
-- `GEMINI_API_KEY` is set in the trusted function secret store (or local `.env`
-  when using direct mode)
+- `AI_BACKEND_URL=direct`
+- `GROQ_API_KEY` is set in the repository-root `.env` for local development,
+  or was entered in the installed APK's Study assistance Settings
 - the selected model name is valid
 - the environment was restarted after the key was added
 

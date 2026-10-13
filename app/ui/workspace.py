@@ -3,22 +3,30 @@ import logging
 import re
 import time as time_module
 from calendar import month_name, monthrange
+from dataclasses import replace
 from datetime import date, datetime, time, timezone
 from typing import Any
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 import flet as ft
 
 from app.models import DocumentNotFoundError, ModelValidationError
 from app.models.subject import Subject
 from app.models.task import Task
+from app.services.ai_config import (
+    clear_saved_groq_api_key,
+    groq_api_key_source,
+    save_groq_api_key,
+)
 from app.services.firebase_auth import AuthSession, FirebaseAuthService
 from app.services.firestore import (
     AuthenticationRequiredError,
     FirestoreError,
     FirestoreService,
 )
-from app.services.gemini import (
-    GeminiServiceError,
+from app.services.groq import (
+    GroqServiceError,
     TaskRecommendationResult,
     chat_about_tasks,
     generate_task_recommendations,
@@ -27,7 +35,15 @@ from app.services.subject_service import SubjectService
 from app.services.subject_service import SubjectInUseError
 from app.services.study_cache import StudyCache
 from app.services.task_service import TaskService
+from app.services.notifications import NotificationPreferences, NotificationScheduler
 from app.ui.task_views import filter_tasks, month_grid, sort_tasks, tasks_for_date
+from app.ui.subject_colors import (
+    SUBJECT_COLOR_FALLBACK,
+    SUBJECT_COLOR_PALETTE,
+    foreground_for_subject_color,
+    subject_color_or_fallback,
+    valid_subject_color,
+)
 from app.ui.theme import (
     apply_theme,
     colors_for,
@@ -75,6 +91,10 @@ class StudyWorkspace:
         )
         self.subjects = SubjectService(self.firestore)
         self.tasks = TaskService(self.firestore, self.subjects)
+        self.notifications = NotificationScheduler(
+            page,
+            on_tap=self._handle_notification_tap,
+        )
         self.record_startup_event(
             "Firebase/Firestore service initialization",
             "success",
@@ -93,6 +113,11 @@ class StudyWorkspace:
         self._data_available = False
         self._data_error = ""
         self._offline_mode = False
+        self._pull_refresh_distance = 0.0
+        self._pull_refresh_threshold = 80.0
+        self._pull_refresh_in_progress = False
+        self._cache_clear_in_progress = False
+        self._cache_clear_status = ""
         self._startup_state = "initializing"
         self._recommendation_loading = False
         self._recommendation_request_id = 0
@@ -103,10 +128,21 @@ class StudyWorkspace:
         self._chat_message = ""
         self._chat_response = ""
         self._chat_error = ""
-        self.dark_mode = load_dark_mode()
+        self._chat_history: list[dict[str, str]] = []
+        self._ai_availability = "unknown"
+        self._chat_suggestions = (
+            "Which tasks should I prioritize",
+            "What task do you recommend to me?",
+        )
+        self._chat_open = False
+        self._last_route = "home"
+        self.dark_mode = False
+        if hasattr(page, "storage"):
+            self.dark_mode = load_dark_mode()
         self._load_request_id = 0
         self._loading_status: ft.Text | None = None
         self._subject_delete_in_progress: set[str] = set()
+        self._notification_permission: bool | None = None
         self._filters_expanded = False
         self._task_filter_values = {
             "subject_id": "",
@@ -116,6 +152,7 @@ class StudyWorkspace:
             "ordering": "deadline_asc",
         }
         apply_theme(page, self.dark_mode)
+        page.on_app_lifecycle_state_change = self._on_app_lifecycle_state_change
 
     def record_startup_event(
         self, operation: str, status: str, details: str
@@ -169,7 +206,7 @@ class StudyWorkspace:
             self._clear_account_data()
             self.on_unauthenticated()
             return
-        if route in (*self._ROUTES, "profile"):
+        if route in (*self._ROUTES, "profile", "assistant"):
             self.route = route
         session = self.auth.session
         if session is None:
@@ -235,11 +272,46 @@ class StudyWorkspace:
             )
             if load_request_id != self._load_request_id:
                 return
+            if session.is_new_account and not self.firestore.offline:
+                try:
+                    seeded_tasks = await self._seed_premade_example_tasks(session)
+                except AuthenticationRequiredError:
+                    raise
+                except (FirestoreError, ModelValidationError, ValueError) as seed_error:
+                    logger.warning(
+                        "Premade task initialization failed for user %s: %s",
+                        session.uid[:8],
+                        seed_error,
+                    )
+                    self.record_startup_event(
+                        "premade task initialization",
+                        "error",
+                        f"{type(seed_error).__name__}: {seed_error}",
+                    )
+                    notice = (
+                        "Your workspace is ready, but the starter tasks could not "
+                        "be added. Refresh to retry."
+                    )
+                else:
+                    self.task_cache.extend(
+                        task
+                        for task in seeded_tasks
+                        if all(existing.id != task.id for existing in self.task_cache)
+                    )
+                    if seeded_tasks:
+                        self.record_startup_event(
+                            "premade task initialization",
+                            "success",
+                            "Added the starter tasks to this new workspace.",
+                        )
+                if load_request_id != self._load_request_id:
+                    return
             self._data_available = True
             self._offline_mode = self.firestore.offline
             self._data_error = ""
             self._startup_state = "ready"
             self._study_cache.save(session.uid, self.task_cache, self.subject_cache)
+            await self._reconcile_notifications()
             logger.info(
                 "Study data %s in %.2f seconds (%d tasks, %d subjects).",
                 "initialized" if initial_startup else "refreshed",
@@ -321,6 +393,40 @@ class StudyWorkspace:
 
     async def _retry_data_load(self) -> None:
         await self.show(self.route, refresh=True)
+
+    async def _reconcile_notifications(self) -> None:
+        session = self.auth.session
+        if session is None:
+            return
+        try:
+            self._notification_permission = (
+                await self.notifications.permission_granted()
+            )
+            await self.notifications.reconcile(
+                session.uid,
+                self.task_cache,
+                self.subject_cache,
+            )
+        except Exception as error:
+            # Notification failures must never prevent task data from rendering.
+            logger.warning("Notification reconciliation failed: %s", error)
+
+    async def _handle_notification_tap(self, task_id: str) -> None:
+        if self.auth.session is None:
+            return
+        task_exists = any(task.id == task_id for task in self.task_cache)
+        await self.show(
+            "tasks",
+            notice=(
+                "Showing the task from your notification."
+                if task_exists
+                else "That task is no longer available."
+            ),
+        )
+
+    def _on_app_lifecycle_state_change(self, event: Any) -> None:
+        if getattr(event, "state", None) == ft.AppLifecycleState.RESUME:
+            self.page.run_task(self._reconcile_notifications)
 
     async def _show_slow_load_status(self, uid: str, request_id: int) -> None:
         await asyncio.sleep(5)
@@ -442,6 +548,75 @@ class StudyWorkspace:
             )
         return tasks, subjects
 
+    async def _seed_premade_example_tasks(
+        self, session: AuthSession
+    ) -> list[Task]:
+        if self.auth.session is None or self.auth.session.uid != session.uid:
+            raise AuthenticationRequiredError(
+                "Your sign-in state changed. Sign in again to continue."
+            )
+
+        marker = await self.firestore.read_document(
+            "workspace_metadata", "premade_tasks_v1"
+        )
+        if marker is not None:
+            self.auth.complete_new_account_initialization()
+            return []
+
+        examples = (
+            {
+                "id": "premade-review-data-structures",
+                "title": "Review Data Structures",
+                "description": (
+                    "Review stacks, queues, and trees. Solve at least five "
+                    "practice problems."
+                ),
+                "priority": "medium",
+                "category": "Study",
+            },
+            {
+                "id": "premade-finish-research-paper",
+                "title": "Finish Research Paper",
+                "description": (
+                    "Complete the introduction and methodology sections, then "
+                    "review the draft."
+                ),
+                "priority": "high",
+                "category": "Assignment",
+            },
+        )
+        seeded_tasks: list[Task] = []
+        for example in examples:
+            if self.auth.session is None or self.auth.session.uid != session.uid:
+                raise AuthenticationRequiredError(
+                    "Your sign-in state changed. Sign in again to continue."
+                )
+            task = await self.tasks.get_task(example["id"])
+            if task is None:
+                task = await self.tasks.create_task(
+                    title=example["title"],
+                    description=example["description"],
+                    deadline=None,
+                    priority=example["priority"],
+                    category=example["category"],
+                    status="pending",
+                    task_id=example["id"],
+                    alarm_enabled=False,
+                )
+            seeded_tasks.append(task)
+
+        if self.auth.session is None or self.auth.session.uid != session.uid:
+            raise AuthenticationRequiredError(
+                "Your sign-in state changed. Sign in again to continue."
+            )
+        await self.firestore.create_document(
+            "workspace_metadata",
+            {"premade_tasks_seeded": True},
+            document_id="premade_tasks_v1",
+        )
+        self.auth.complete_new_account_initialization()
+        return seeded_tasks
+
     async def _load_collections(self) -> tuple[list[Task], list[Subject]]:
         import asyncio
 
@@ -481,6 +656,90 @@ class StudyWorkspace:
 
         return FirestoreDocument(document_id, data)
 
+    def _safe_disposable_cache_cleanup(self, *, uid: str | None = None) -> bool:
+        """Clear only the app-owned snapshot cache, never login state or remote data."""
+        if self._study_cache is None:
+            return False
+        cleared = True
+        if uid is not None:
+            cleared = self._study_cache.clear(uid) and cleared
+        cleared = self._study_cache.clear("guest") and cleared
+        return cleared
+
+    def _pull_refresh_indicator(self) -> ft.Container:
+        visible = self._data_loading or self._pull_refresh_distance > 0
+        if not visible:
+            return ft.Container(height=0, padding=0)
+        progress = 1.0 if self._data_loading else min(
+            self._pull_refresh_distance / self._pull_refresh_threshold, 1.0
+        )
+        text = "Refreshing your study data..." if self._data_loading else (
+            "Release to refresh"
+            if self._pull_refresh_distance >= self._pull_refresh_threshold
+            else "Pull to refresh"
+        )
+        return ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.ProgressBar(value=progress, bgcolor=self._surface_color()),
+                    ft.Text(
+                        text,
+                        size=12,
+                        color=self._secondary_text_color(),
+                        text_align=ft.TextAlign.CENTER,
+                        width=200,
+                    ),
+                ],
+                spacing=6,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            height=48,
+            alignment=ft.Alignment.CENTER,
+            padding=ft.Padding(0, 4, 0, 0),
+        )
+
+    def _handle_refresh_scroll(self, event: ft.OnScrollEvent) -> None:
+        if self.route not in {"home", "tasks", "calendar"}:
+            return
+        if self.auth.session is None or self._data_loading or self._pull_refresh_in_progress:
+            return
+        if event.event_type == ft.ScrollType.OVERSCROLL and event.overscroll is not None:
+            if event.overscroll < 0 and event.pixels <= event.min_scroll_extent:
+                overscroll = abs(event.overscroll)
+                self._pull_refresh_distance = min(overscroll, self._pull_refresh_threshold * 1.5)
+                if self._pull_refresh_distance >= self._pull_refresh_threshold:
+                    self.page.run_task(self._trigger_pull_refresh)
+                    self._pull_refresh_in_progress = True
+            else:
+                self._pull_refresh_distance = 0.0
+        elif event.event_type in {ft.ScrollType.END, ft.ScrollType.START}:
+            self._pull_refresh_distance = 0.0
+
+    async def _trigger_pull_refresh(self) -> None:
+        if self.auth.session is None or self._data_loading:
+            self._pull_refresh_in_progress = False
+            self._pull_refresh_distance = 0.0
+            return
+        try:
+            await self.show(self.route, refresh=True)
+        finally:
+            self._pull_refresh_in_progress = False
+            self._pull_refresh_distance = 0.0
+
+    def _with_refresh_support(self, control: ft.Control) -> ft.Control:
+        if self.route not in {"home", "tasks", "calendar"}:
+            return control
+        if isinstance(control, ft.ScrollableControl):
+            existing = getattr(control, "on_scroll", None)
+
+            def on_scroll(event: ft.OnScrollEvent) -> None:
+                self._handle_refresh_scroll(event)
+                if callable(existing):
+                    existing(event)
+
+            control.on_scroll = on_scroll
+        return control
+
     def _render(
         self, session: AuthSession, *, notice: str = "", error: str = ""
     ) -> None:
@@ -488,6 +747,7 @@ class StudyWorkspace:
             "home": "Smart Study Task Manager",
             "tasks": "My Tasks",
             "calendar": "Calendar",
+            "assistant": "Study Assistant",
             "settings": "Settings",
             "profile": "Profile",
         }[self.route]
@@ -545,6 +805,7 @@ class StudyWorkspace:
                 controls=[
                     ft.Container(header, padding=ft.Padding(16, 12, 8, 8)),
                     *status_controls,
+                    self._pull_refresh_indicator(),
                     ft.Container(content=body, expand=True, padding=ft.Padding(16, 4, 16, 12)),
                     ft.SafeArea(
                         content=self._navigation_bar(),
@@ -611,29 +872,31 @@ class StudyWorkspace:
 
     def _build_screen(self, session: AuthSession) -> ft.Control:
         if self.route == "home":
-            return self._dashboard()
+            return self._with_refresh_support(self._dashboard())
         if self.route == "tasks":
-            return self._task_screen()
+            return self._with_refresh_support(self._task_screen())
         if self.route == "calendar":
-            return self._calendar_screen()
+            return self._with_refresh_support(self._calendar_screen())
+        if self.route == "assistant":
+            return self._chatbot_screen()
         if self.route == "settings":
             return self._settings_screen()
         return self._profile_screen(session)
 
     def _dashboard(self) -> ft.Control:
-        today = date.today()
+        now = datetime.now().astimezone()
         overdue = [
             task
             for task in self.task_cache
             if task.deadline is not None
-            and task.deadline.astimezone().date() < today
+            and task.deadline < now
             and task.status != "completed"
         ]
         upcoming = [
             task
             for task in self.task_cache
             if task.deadline is not None
-            and task.deadline.astimezone().date() >= today
+            and task.deadline >= now
         ]
         upcoming.sort(key=lambda task: task.deadline or datetime.max.replace(tzinfo=timezone.utc))
         completed = sum(task.status == "completed" for task in self.task_cache)
@@ -645,13 +908,7 @@ class StudyWorkspace:
                 ft.ProgressBar(value=progress),
                 self._section("Overdue", overdue[:5], "No overdue tasks."),
                 self._section("Upcoming", upcoming[:5], "No upcoming tasks."),
-                ft.Container(
-                    content=self._recommendation_panel(),
-                    padding=16,
-                    bgcolor=self._accent_surface_color(),
-                    border_radius=12,
-                ),
-                self._chat_panel(),
+                self._chatbot_entry_card(),
                 ft.Button(
                     content="View all tasks",
                     on_click=lambda _: self.page.run_task(self.show, "tasks"),
@@ -659,6 +916,338 @@ class StudyWorkspace:
             ],
             spacing=14,
             expand=True,
+        )
+
+    def _chatbot_entry_card(self) -> ft.Control:
+        return ft.Container(
+            content=ft.Row(
+                controls=[
+                    ft.Icon(ft.Icons.CHAT_BUBBLE_OUTLINE, size=30),
+                    ft.Column(
+                        controls=[
+                            ft.Text("Study Assistant", size=18, weight=ft.FontWeight.BOLD),
+                            ft.Text(
+                                "Ask about your tasks and what to work on next.",
+                                color=self._secondary_text_color(),
+                            ),
+                        ],
+                        spacing=3,
+                        expand=True,
+                    ),
+                    ft.Button(
+                        content="Open",
+                        icon=ft.Icons.ARROW_FORWARD,
+                        on_click=lambda _: self._open_chatbot(),
+                    ),
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=16,
+            bgcolor=self._accent_surface_color(),
+            border_radius=12,
+            on_click=lambda _: self._open_chatbot(),
+        )
+
+    def _open_chatbot(self) -> None:
+        if self.auth.session is None:
+            return
+        self._last_route = self.route if self.route != "assistant" else self._last_route or "home"
+        self.route = "assistant"
+        self._render(self.auth.session, error=self._data_error)
+
+    def _toggle_chatbot(self, _: Any) -> None:
+        self._chat_open = not self._chat_open
+        if self.auth.session is not None:
+            self._render(self.auth.session, error=self._data_error)
+
+    def _open_chat_markdown_link(self, event: Any) -> None:
+        url = getattr(event, "data", None)
+        if not isinstance(url, str) or any(character.isspace() for character in url):
+            logger.warning("Blocked an invalid Study Assistant Markdown link.")
+            return
+        try:
+            parsed_url = urlsplit(url)
+            hostname = parsed_url.hostname
+        except ValueError:
+            logger.warning("Blocked an invalid Study Assistant Markdown link.")
+            return
+        if (
+            parsed_url.scheme.casefold() not in {"http", "https"}
+            or not hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+        ):
+            logger.warning("Blocked an unsupported Study Assistant Markdown link.")
+            return
+        self.page.run_task(ft.UrlLauncher().launch_url, url)
+
+    def _chat_bubble(self, speaker: str, text: str) -> ft.Container:
+        is_user = speaker == "user"
+        text_color = (
+            colors_for(self.dark_mode).on_primary
+            if is_user
+            else colors_for(self.dark_mode).text
+        )
+        if is_user:
+            message_content: ft.Control = ft.Text(
+                text,
+                color=text_color,
+                selectable=True,
+                no_wrap=False,
+            )
+        else:
+            try:
+                message_content = ft.Markdown(
+                    value=text,
+                    selectable=True,
+                    extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                    on_tap_link=self._open_chat_markdown_link,
+                    shrink_wrap=False,
+                    fit_content=False,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not create Markdown rendering for a Study Assistant response."
+                )
+                message_content = ft.Text(
+                    text,
+                    color=text_color,
+                    selectable=True,
+                    no_wrap=False,
+                )
+        bubble = ft.Container(
+            content=message_content,
+            padding=12,
+            border_radius=12,
+            bgcolor=(
+                colors_for(self.dark_mode).primary if is_user else self._raised_surface_color()
+            ),
+        )
+        outer = ft.Container(
+            content=ft.Row(
+                controls=[
+                    ft.Column(
+                        controls=[
+                            ft.Text(
+                                "You" if is_user else "Study Assistant",
+                                size=12,
+                                weight=ft.FontWeight.BOLD,
+                                color=self._secondary_text_color(),
+                            ),
+                            bubble,
+                        ],
+                        spacing=4,
+                        horizontal_alignment=(
+                            ft.CrossAxisAlignment.END
+                            if is_user
+                            else ft.CrossAxisAlignment.START
+                        ),
+                        tight=True,
+                        expand=True,
+                    )
+                ],
+                alignment=(
+                    ft.MainAxisAlignment.END if is_user else ft.MainAxisAlignment.START
+                ),
+                expand=True,
+            ),
+            padding=ft.Padding(0, 0, 0, 8),
+            expand=True,
+        )
+        return outer
+
+    def _chatbot_screen(self) -> ft.Control:
+        if self.auth.session is None:
+            return ft.Text("Sign in to use the assistant.")
+        is_guest = self.auth.session.is_guest
+        is_disabled = (
+            is_guest
+            or self._offline_mode
+            or self._data_loading
+            or not self._data_available
+            or self._data_uid != self.auth.session.uid
+        )
+        suggestions = [
+            ft.TextButton(
+                prompt,
+                disabled=is_disabled or self._chat_loading,
+                on_click=lambda _, prompt=prompt: self.page.run_task(
+                    self._send_chat_message, prompt
+                ),
+            )
+            for prompt in self._chat_suggestions
+        ]
+        send_button = ft.Button(
+            content=(
+                ft.ProgressRing(width=18, height=18, stroke_width=2)
+                if self._chat_loading
+                else "Retry" if self._chat_error else "Send"
+            ),
+            icon=None if self._chat_loading else ft.Icons.SEND,
+            disabled=(
+                is_disabled
+                or self._chat_loading
+                or not self._chat_message.strip()
+            ),
+            on_click=lambda _: self.page.run_task(
+                self._send_chat_message, self._chat_message
+            ),
+            width=96,
+            height=48,
+        )
+
+        def update_chat_message(event: Any) -> None:
+            self._chat_message = event.control.value or ""
+            send_button.disabled = (
+                is_disabled
+                or self._chat_loading
+                or not self._chat_message.strip()
+            )
+            self.page.update(send_button)
+
+        messages = ft.ListView(
+            controls=[
+                *[
+                    self._chat_bubble(entry["role"], entry["text"])
+                    for entry in self._chat_history
+                ],
+                *(
+                    [
+                        ft.Container(
+                            content=ft.Column(
+                                controls=[
+                                    ft.Text("Study Assistant", size=18, weight=ft.FontWeight.BOLD),
+                                    ft.Text(
+                                        "Ask about your current tasks and what to work on next.",
+                                        color=self._secondary_text_color(),
+                                    ),
+                                ],
+                                spacing=4,
+                            ),
+                            padding=12,
+                            bgcolor=self._raised_surface_color(),
+                            border_radius=10,
+                        )
+                    ]
+                    if not self._chat_history
+                    else []
+                ),
+            ],
+            spacing=8,
+            expand=True,
+            auto_scroll=True,
+        )
+        return ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[
+                        ft.IconButton(
+                            icon=ft.Icons.ARROW_BACK,
+                            on_click=lambda _: self.page.run_task(self.show, self._last_route or "home"),
+                        ),
+                        ft.Column(
+                            controls=[
+                                ft.Text("Study Assistant", size=20, weight=ft.FontWeight.BOLD),
+                                ft.Text(
+                                    "Academic planning help for your study tasks.",
+                                    color=self._secondary_text_color(),
+                                ),
+                                self._ai_availability_indicator(),
+                            ],
+                            spacing=2,
+                            expand=True,
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Text("Suggested prompts", size=14, weight=ft.FontWeight.BOLD),
+                            ft.Row(
+                                controls=suggestions,
+                                wrap=True,
+                            ),
+                        ],
+                        spacing=8,
+                    ),
+                    padding=12,
+                    bgcolor=self._accent_surface_color(),
+                    border_radius=10,
+                ),
+                messages,
+                ft.Row(
+                    controls=[
+                        ft.TextField(
+                            label="Ask about your tasks...",
+                            value=self._chat_message,
+                            multiline=True,
+                            min_lines=2,
+                            max_lines=5,
+                            expand=True,
+                            on_submit=lambda event: self.page.run_task(
+                                self._send_chat_message, event.control.value or ""
+                            ),
+                            on_change=update_chat_message,
+                            disabled=is_disabled or self._chat_loading,
+                            hint_text="Ask about your tasks...",
+                        ),
+                        send_button,
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.END,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        self._chat_error or (
+                            "Offline mode or no data available."
+                            if self._offline_mode or not self._data_available
+                            else ""
+                        ),
+                        color=self._error_text_color(),
+                    ),
+                    visible=bool(self._chat_error or self._offline_mode or not self._data_available),
+                ),
+            ],
+            spacing=10,
+            expand=True,
+        )
+
+    def _ai_availability_indicator(self) -> ft.Control:
+        if self._chat_loading:
+            label = (
+                "Reconnecting to AI service…"
+                if self._ai_availability == "unavailable"
+                else "Checking AI service…"
+            )
+            icon: ft.Control = ft.ProgressRing(width=14, height=14, stroke_width=2)
+            color = self._secondary_text_color()
+        else:
+            labels = {
+                "unknown": "AI availability not checked",
+                "available": "AI service available",
+                "unavailable": "AI service unavailable",
+            }
+            icons = {
+                "unknown": ft.Icons.HELP_OUTLINE,
+                "available": ft.Icons.CHECK_CIRCLE,
+                "unavailable": ft.Icons.ERROR_OUTLINE,
+            }
+            label = labels[self._ai_availability]
+            icon = ft.Icon(icons[self._ai_availability], size=14)
+            color = {
+                "unknown": self._secondary_text_color(),
+                "available": colors_for(self.dark_mode).accent,
+                "unavailable": self._error_text_color(),
+            }[self._ai_availability]
+        return ft.Row(
+            controls=[
+                icon,
+                ft.Text(label, size=12, color=color),
+            ],
+            spacing=6,
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
     def _recommendation_panel(self) -> ft.Control:
@@ -873,7 +1462,7 @@ class StudyWorkspace:
             result = await generate_task_recommendations(
                 tasks, subjects, id_token=session.id_token
             )
-        except GeminiServiceError as error:
+        except GroqServiceError as error:
             if self._recommendation_request_is_current(session.uid, request_id):
                 self._recommendation_error = str(error)
         else:
@@ -897,28 +1486,64 @@ class StudyWorkspace:
             or self._data_uid != session.uid
         ):
             return
+        cleaned_message = message.strip()
+        if not cleaned_message:
+            return
         request_id = self._chat_request_id
+        message_id = uuid4().hex
         tasks = tuple(self.task_cache)
         subjects = tuple(self.subject_cache)
-        self._chat_message = message
+        self._chat_history.append(
+            {"id": message_id, "role": "user", "text": cleaned_message}
+        )
+        self._chat_message = ""
         self._chat_loading = True
         self._chat_error = ""
         self._render(session)
         try:
             response = await chat_about_tasks(
-                message, tasks, subjects, id_token=session.id_token
+                cleaned_message, tasks, subjects, id_token=session.id_token
             )
-        except GeminiServiceError as error:
+            if not isinstance(response, str) or not response.strip():
+                raise GroqServiceError(
+                    "The AI service returned an empty or invalid response. Please retry."
+                )
+        except GroqServiceError as error:
             if self._chat_request_is_current(session.uid, request_id):
                 self._chat_error = str(error)
+                self._chat_message = cleaned_message
+                self._remove_chat_message(message_id)
+                self._ai_availability = error.availability
+        except asyncio.CancelledError:
+            if self._chat_request_is_current(session.uid, request_id):
+                self._chat_message = cleaned_message
+                self._remove_chat_message(message_id)
+            logger.info("Study Assistant request was cancelled.")
+            raise
+        except Exception:
+            logger.exception("Study Assistant request failed unexpectedly.")
+            if self._chat_request_is_current(session.uid, request_id):
+                self._chat_error = (
+                    "The assistant could not complete that request. Please try again."
+                )
+                self._chat_message = cleaned_message
+                self._remove_chat_message(message_id)
+                self._ai_availability = "unknown"
         else:
             if self._chat_request_is_current(session.uid, request_id):
                 self._chat_response = response
+                self._chat_history.append({"role": "assistant", "text": response})
+                self._ai_availability = "available"
         finally:
             if self._chat_request_is_current(session.uid, request_id):
                 self._chat_loading = False
-                if self.route == "home":
+                if self.route in {"home", "assistant"}:
                     self._render(session)
+
+    def _remove_chat_message(self, message_id: str) -> None:
+        self._chat_history = [
+            entry for entry in self._chat_history if entry.get("id") != message_id
+        ]
 
     def _recommendation_request_is_current(self, uid: str, request_id: int) -> bool:
         return (
@@ -958,6 +1583,8 @@ class StudyWorkspace:
         self._chat_message = ""
         self._chat_response = ""
         self._chat_error = ""
+        self._chat_history = []
+        self._ai_availability = "unknown"
 
     def _section(self, title: str, tasks: list[Task], empty_text: str) -> ft.Control:
         return ft.Column(
@@ -989,6 +1616,7 @@ class StudyWorkspace:
             ),
             expand=True,
         )
+
         status_filter = ft.Dropdown(
             label="Status",
             value=self._task_filter_values["status"],
@@ -1207,9 +1835,13 @@ class StudyWorkspace:
                     else self._secondary_text_color()
                 ),
                 icon_color=(
-                    colors_for(self.dark_mode).primary
-                    if selected
-                    else self._secondary_text_color()
+                    subject_color_or_fallback(getattr(subject, "color", None))
+                    if subject
+                    else (
+                        colors_for(self.dark_mode).primary
+                        if selected
+                        else self._secondary_text_color()
+                    )
                 ),
                 bgcolor=(
                     self._accent_surface_color()
@@ -1248,6 +1880,10 @@ class StudyWorkspace:
         if subject.id in self._subject_delete_in_progress:
             return
 
+        def edit(_: Any = None) -> None:
+            self.page.pop_dialog()
+            self._show_subject_dialog(subject)
+
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
@@ -1256,6 +1892,11 @@ class StudyWorkspace:
                 actions=[
                     ft.TextButton(
                         "Cancel", on_click=lambda _: self.page.pop_dialog()
+                    ),
+                    ft.TextButton(
+                        "Edit Subject",
+                        icon=ft.Icons.EDIT,
+                        on_click=edit,
                     ),
                     ft.TextButton(
                         "Delete Subject",
@@ -1336,7 +1977,15 @@ class StudyWorkspace:
                 if selected
                 else self._secondary_text_color()
             )
-            button.icon_color = button.color
+            subject = next(
+                (item for item in self.subject_cache if item.id == subject_id),
+                None,
+            )
+            button.icon_color = (
+                subject_color_or_fallback(getattr(subject, "color", None))
+                if subject
+                else button.color
+            )
             button.bgcolor = (
                 self._accent_surface_color()
                 if selected
@@ -1404,11 +2053,7 @@ class StudyWorkspace:
             (subject for subject in self.subject_cache if subject.id == task.subject_id),
             None,
         )
-        deadline = (
-            task.deadline.astimezone().strftime("%b %d, %Y")
-            if task.deadline
-            else "No deadline"
-        )
+        deadline = self._format_deadline(task.deadline)
         metadata = " · ".join(
             value
             for value in [
@@ -1422,12 +2067,19 @@ class StudyWorkspace:
         )
         if compact:
             return ft.Container(
-                content=ft.Column(
-                    [
-                        ft.Text(task.title, weight=ft.FontWeight.BOLD),
-                        ft.Text(metadata, size=12),
+                content=ft.Row(
+                    controls=[
+                        self._subject_color_indicator(subject),
+                        ft.Column(
+                            [
+                                ft.Text(task.title, weight=ft.FontWeight.BOLD),
+                                ft.Text(metadata, size=12),
+                            ],
+                            spacing=3,
+                            expand=True,
+                        ),
                     ],
-                    spacing=3,
+                    spacing=8,
                 ),
                 padding=12,
                 bgcolor=self._surface_color(),
@@ -1436,6 +2088,7 @@ class StudyWorkspace:
         return ft.Container(
             content=ft.Row(
                 controls=[
+                    self._subject_color_indicator(subject),
                     ft.Checkbox(
                         value=task.status == "completed",
                         on_change=lambda event, item=task: self.page.run_task(
@@ -1469,6 +2122,28 @@ class StudyWorkspace:
             border_radius=10,
         )
 
+    def _subject_color_indicator(self, subject: Subject | None) -> ft.Control:
+        return ft.Container(
+            width=6,
+            height=34,
+            bgcolor=(
+                subject_color_or_fallback(getattr(subject, "color", None))
+                if subject
+                else self._secondary_text_color()
+            ),
+            border_radius=3,
+            tooltip=(f"Subject color: {subject.title}" if subject else "No subject color"),
+        )
+
+    @staticmethod
+    def _format_deadline(deadline: datetime | None) -> str:
+        if deadline is None:
+            return "No deadline"
+        local_deadline = deadline.astimezone()
+        return local_deadline.strftime("%b %d, %Y · %I:%M %p").replace(
+            " 0", " "
+        )
+
     async def _toggle_task(self, task: Task, checked: bool) -> None:
         try:
             await self.tasks.update_task(
@@ -1493,6 +2168,15 @@ class StudyWorkspace:
         selected_deadline: date | None = (
             task.deadline.astimezone().date() if task and task.deadline else None
         )
+        selected_time: time = (
+            task.deadline.astimezone().time().replace(second=0, microsecond=0)
+            if task and task.deadline
+            else time(23, 59)
+        )
+
+        def format_selected_time(value: time) -> str:
+            return value.strftime("%I:%M %p").lstrip("0")
+
         deadline = ft.TextField(
             label="Deadline (optional)",
             value=(
@@ -1504,6 +2188,29 @@ class StudyWorkspace:
             on_click=lambda _=None: self.page.show_dialog(deadline_picker),
             expand=True,
         )
+        deadline_time = ft.TextField(
+            label="Time",
+            value=format_selected_time(selected_time),
+            read_only=True,
+            on_click=lambda _=None: self.page.show_dialog(time_picker),
+            expand=True,
+        )
+        deadline_preview = ft.Text(
+            size=12,
+            color=self._secondary_text_color(),
+        )
+        alarm_enabled = ft.Checkbox(
+            label="Alarm at due time",
+            value=task.alarm_enabled if task else True,
+        )
+
+        def update_deadline_preview() -> None:
+            deadline_preview.value = (
+                f"Selected deadline: {selected_deadline.strftime('%B %d, %Y')} "
+                f"· {format_selected_time(selected_time)}"
+                if selected_deadline
+                else "No deadline selected"
+            )
 
         def update_deadline(event: Any) -> None:
             nonlocal selected_deadline
@@ -1514,6 +2221,7 @@ class StudyWorkspace:
                 selected_deadline = picked
                 deadline.value = picked.strftime("%b %d, %Y")
                 clear_deadline_button.visible = True
+                update_deadline_preview()
                 self.page.update()
 
         deadline_picker = ft.DatePicker(
@@ -1527,11 +2235,32 @@ class StudyWorkspace:
             on_change=update_deadline,
         )
 
+        def update_deadline_time(event: Any) -> None:
+            nonlocal selected_time
+            picked = event.control.value
+            if isinstance(picked, time):
+                selected_time = picked.replace(second=0, microsecond=0)
+                deadline_time.value = format_selected_time(selected_time)
+                update_deadline_preview()
+                self.page.update()
+
+        time_picker = ft.TimePicker(
+            value=selected_time,
+            modal=True,
+            help_text="Select task deadline time",
+            confirm_text="Select",
+            cancel_text="Cancel",
+            hour_format=ft.TimePickerHourFormat.H12,
+            on_change=update_deadline_time,
+        )
+        update_deadline_preview()
+
         def clear_deadline(_: Any = None) -> None:
             nonlocal selected_deadline
             selected_deadline = None
             deadline.value = ""
             clear_deadline_button.visible = False
+            update_deadline_preview()
             self.page.update()
 
         clear_deadline_button = ft.IconButton(
@@ -1581,7 +2310,7 @@ class StudyWorkspace:
                 self.page.update()
                 return
             try:
-                due = self._deadline_for_date(selected_deadline)
+                due = self._deadline_for_date(selected_deadline, selected_time)
                 changes = {
                     "title": title.value.strip(),
                     "description": description.value or "",
@@ -1591,6 +2320,7 @@ class StudyWorkspace:
                     "category": (category.value or "general").strip(),
                     "status": status.value or "pending",
                     "tags": [tag.strip() for tag in (tags.value or "").split(",") if tag.strip()],
+                    "alarm_enabled": bool(alarm_enabled.value),
                 }
                 if task:
                     await self.tasks.update_task(task.id, changes)
@@ -1607,7 +2337,14 @@ class StudyWorkspace:
                 self.page.update()
                 return
             self.page.pop_dialog()
-            await self.show(return_route, notice="Task saved.", refresh=True)
+            notice = "Task saved."
+            if alarm_enabled.value and due is not None and due <= datetime.now(timezone.utc):
+                notice = (
+                    "Task saved. Its deadline has passed, so no alarm was scheduled."
+                )
+            elif alarm_enabled.value and due is None:
+                notice = "Task saved. Set a deadline to schedule its alarm."
+            await self.show(return_route, notice=notice, refresh=True)
 
         dialog = ft.AlertDialog(
             modal=True,
@@ -1630,6 +2367,26 @@ class StudyWorkspace:
                         ],
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
+                    ft.Row(
+                        controls=[
+                            deadline_time,
+                            ft.IconButton(
+                                icon=ft.Icons.ACCESS_TIME,
+                                tooltip="Choose deadline time",
+                                on_click=lambda _=None: self.page.show_dialog(
+                                    time_picker
+                                ),
+                            ),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    deadline_preview,
+                    alarm_enabled,
+                    ft.Text(
+                        "Requires task notifications and deadline alerts to be enabled in Settings.",
+                        size=12,
+                        color=self._secondary_text_color(),
+                    ),
                     subject,
                     priority,
                     category,
@@ -1651,38 +2408,148 @@ class StudyWorkspace:
         self.page.show_dialog(dialog)
 
     @staticmethod
-    def _deadline_for_date(selected_day: date | None) -> datetime | None:
+    def _deadline_for_date(
+        selected_day: date | None, selected_time: time = time(23, 59)
+    ) -> datetime | None:
         if selected_day is None:
             return None
-        return datetime.combine(selected_day, time(23, 59)).astimezone()
+        if not isinstance(selected_time, time):
+            raise ValueError("Deadline time is invalid.")
+        return datetime.combine(selected_day, selected_time).astimezone()
 
-    def _show_subject_dialog(self) -> None:
-        title = ft.TextField(label="Subject title")
-        color = ft.TextField(label="Color (hex)", value="#2196F3")
-        description = ft.TextField(label="Description", multiline=True, min_lines=2)
+    def _show_subject_dialog(self, subject: Subject | None = None) -> None:
+        title = ft.TextField(
+            label="Subject title", value=subject.title if subject else ""
+        )
+        description = ft.TextField(
+            label="Description",
+            value=subject.description if subject else "",
+            multiline=True,
+            min_lines=2,
+        )
+        selected_color = subject_color_or_fallback(
+            subject.color if subject else SUBJECT_COLOR_FALLBACK
+        )
+        palette_values = {value.casefold() for _, value in SUBJECT_COLOR_PALETTE}
+        saved_color_is_legacy = bool(
+            subject
+            and valid_subject_color(subject.color)
+            and subject.color.casefold() not in palette_values
+        )
+        selected_color_text = ft.Text(size=12)
+        color_was_changed = False
+        swatches: list[ft.Container] = []
+        swatch_labels: dict[str, str] = {}
+        palette_options = list(SUBJECT_COLOR_PALETTE)
+        if saved_color_is_legacy:
+            palette_options.append(("Saved", selected_color))
+
+        def refresh_color_selection() -> None:
+            selected_color_text.value = (
+                f"Selected color: {selected_color}"
+                + (" (saved color)" if saved_color_is_legacy else "")
+            )
+            for swatch in swatches:
+                is_selected = swatch.data.casefold() == selected_color.casefold()
+                swatch.border = ft.Border.all(
+                    3 if is_selected else 1,
+                    colors_for(self.dark_mode).text,
+                )
+                swatch.content.controls[-1].value = (
+                    "Selected" if is_selected else swatch_labels[swatch.data]
+                )
+            self.page.update()
+
+        def select_color(value: str) -> None:
+            nonlocal selected_color, saved_color_is_legacy, color_was_changed
+            selected_color = value
+            saved_color_is_legacy = False
+            color_was_changed = True
+            refresh_color_selection()
+
+        for label, value in palette_options:
+            foreground = foreground_for_subject_color(value)
+            swatch = ft.Container(
+                data=value,
+                content=ft.Column(
+                    [
+                        ft.Icon(ft.Icons.CHECK, color=foreground, size=18),
+                        ft.Text(label, color=foreground, size=11),
+                    ],
+                    tight=True,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                alignment=ft.Alignment.CENTER,
+                bgcolor=value,
+                border_radius=10,
+                width=76,
+                height=62,
+                on_click=lambda _, color_value=value: select_color(color_value),
+            )
+            swatches.append(swatch)
+            swatch_labels[value] = label
+
+        color_palette = ft.ResponsiveRow(
+            controls=[
+                ft.Container(content=swatch, col={"xs": 6, "sm": 3, "md": 1.5})
+                for swatch in swatches
+            ],
+            spacing=6,
+            run_spacing=6,
+        )
+        refresh_color_selection()
         error = ft.Text(color=self._error_text_color(), visible=False)
 
         async def save(_: Any) -> None:
             try:
-                await self.subjects.create_subject(
-                    title.value or "",
-                    color=color.value or "#2196F3",
-                    description=description.value or "",
-                )
+                color_to_save = selected_color
+                if (
+                    subject
+                    and not valid_subject_color(subject.color)
+                    and not color_was_changed
+                ):
+                    color_to_save = subject.color
+                if subject:
+                    await self.subjects.update_subject(
+                        subject.id,
+                        {
+                            "title": title.value or "",
+                            "color": color_to_save,
+                            "description": description.value or "",
+                        },
+                    )
+                else:
+                    await self.subjects.create_subject(
+                        title.value or "",
+                        color=selected_color,
+                        description=description.value or "",
+                    )
             except (FirestoreError, ModelValidationError, ValueError) as save_error:
                 error.value = str(save_error)
                 error.visible = True
                 self.page.update()
                 return
             self.page.pop_dialog()
-            await self.show("tasks", notice="Subject created.", refresh=True)
+            await self.show(
+                "tasks",
+                notice="Subject updated." if subject else "Subject created.",
+                refresh=True,
+            )
 
         self.page.show_dialog(
             ft.AlertDialog(
                 modal=True,
-                title=ft.Text("Add subject"),
+                title=ft.Text("Edit subject" if subject else "Add subject"),
                 content=ft.Column(
-                    controls=[title, color, description, error], tight=True
+                    controls=[
+                        title,
+                        ft.Text("Choose a color", weight=ft.FontWeight.BOLD),
+                        color_palette,
+                        selected_color_text,
+                        description,
+                        error,
+                    ],
+                    tight=True,
                 ),
                 actions=[
                     ft.TextButton("Cancel", on_click=lambda _: self.page.pop_dialog()),
@@ -1887,6 +2754,56 @@ class StudyWorkspace:
             value=self.dark_mode,
             on_change=self._set_dark_mode,
         )
+        clear_cache_button = ft.OutlinedButton(
+            content=(
+                ft.Row(
+                    controls=[
+                        ft.ProgressRing(width=16, height=16, stroke_width=2),
+                        ft.Text("Refreshing before clearing..."),
+                    ],
+                    spacing=8,
+                    tight=True,
+                )
+                if self._cache_clear_in_progress
+                else "Clear Cache"
+            ),
+            icon=None if self._cache_clear_in_progress else ft.Icons.DELETE_OUTLINE,
+            disabled=self._cache_clear_in_progress or self._data_loading,
+            on_click=lambda _: self.page.run_task(self._clear_study_cache),
+        )
+        groq_api_key = ft.TextField(
+            label="Groq API key",
+            password=True,
+            can_reveal_password=True,
+            hint_text="Enter your key; it is saved only on this device.",
+        )
+        groq_key_status = ft.Text(
+            groq_api_key_source(),
+            size=12,
+            color=self._secondary_text_color(),
+        )
+        session = self.auth.session
+        notification_preferences = (
+            self.notifications.get_preferences(session.uid)
+            if session is not None
+            else NotificationPreferences()
+        )
+        if self._notification_permission is True:
+            permission_message = "Android notification permission: allowed."
+        elif self._notification_permission is False:
+            permission_message = (
+                "Android notification permission: denied. Enable it in system settings."
+            )
+        else:
+            permission_message = self.notifications.unavailable_reason
+        permission_button = ft.TextButton(
+            "Open Android notification settings",
+            icon=ft.Icons.OPEN_IN_NEW,
+            visible=self.notifications.platform_available,
+            on_click=lambda _: self.page.run_task(
+                self._open_notification_settings
+            ),
+        )
         return ft.ListView(
             controls=[
                 ft.Container(
@@ -1911,7 +2828,144 @@ class StudyWorkspace:
                     border_radius=12,
                 ),
                 ft.Divider(),
+                ft.Text("Task notifications", size=18, weight=ft.FontWeight.BOLD),
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Text(
+                                "The master switch and Android permission apply to all task "
+                                "notifications. Deadline-time alerts also require the task's "
+                                "Alarm at due time option.",
+                                size=13,
+                                color=self._secondary_text_color(),
+                            ),
+                            ft.Switch(
+                                label="Enable task notifications",
+                                value=notification_preferences.enabled,
+                                on_change=lambda event: self.page.run_task(
+                                    self._set_notification_preference,
+                                    "enabled",
+                                    event,
+                                ),
+                            ),
+                            ft.Switch(
+                                label="Reminder 24 hours before",
+                                value=notification_preferences.reminder_24_hours,
+                                on_change=lambda event: self.page.run_task(
+                                    self._set_notification_preference,
+                                    "reminder_24_hours",
+                                    event,
+                                ),
+                            ),
+                            ft.Switch(
+                                label="Reminder 1 hour before",
+                                value=notification_preferences.reminder_1_hour,
+                                on_change=lambda event: self.page.run_task(
+                                    self._set_notification_preference,
+                                    "reminder_1_hour",
+                                    event,
+                                ),
+                            ),
+                            ft.Switch(
+                                label="One-time deadline alert (alarm-enabled tasks)",
+                                value=notification_preferences.overdue_alert,
+                                on_change=lambda event: self.page.run_task(
+                                    self._set_notification_preference,
+                                    "overdue_alert",
+                                    event,
+                                ),
+                            ),
+                            ft.Text(
+                                permission_message,
+                                size=12,
+                                color=self._secondary_text_color(),
+                            ),
+                            permission_button,
+                        ],
+                        spacing=6,
+                    ),
+                    padding=14,
+                    bgcolor=self._surface_color(),
+                    border_radius=12,
+                ),
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Text("Clear Cache", size=18, weight=ft.FontWeight.BOLD),
+                            ft.Text(
+                                "Refresh your study data, then clear the saved local "
+                                "snapshot. Your tasks and subjects are not deleted.",
+                                size=13,
+                                color=self._secondary_text_color(),
+                            ),
+                            clear_cache_button,
+                            ft.Text(
+                                self._cache_clear_status,
+                                size=12,
+                                color=(
+                                    self._error_text_color()
+                                    if self._cache_clear_status.startswith(
+                                        ("Could not", "Offline")
+                                    )
+                                    else self._secondary_text_color()
+                                ),
+                                visible=bool(self._cache_clear_status),
+                            ),
+                        ],
+                        spacing=6,
+                    ),
+                    padding=14,
+                    bgcolor=self._surface_color(),
+                    border_radius=12,
+                ),
+                ft.Divider(),
                 ft.Text("Study assistance", size=18, weight=ft.FontWeight.BOLD),
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Text("Groq direct mode"),
+                            ft.Text(
+                                "Chat and recommendations call Groq directly. "
+                                "No Firebase Cloud Function is used.",
+                                size=12,
+                                color=self._secondary_text_color(),
+                            ),
+                            groq_key_status,
+                            groq_api_key,
+                            ft.Row(
+                                controls=[
+                                    ft.FilledButton(
+                                        "Save key on this device",
+                                        on_click=lambda _: self.page.run_task(
+                                            self._save_groq_api_key,
+                                            groq_api_key,
+                                            groq_key_status,
+                                        ),
+                                    ),
+                                    ft.TextButton(
+                                        "Remove saved key",
+                                        on_click=lambda _: self.page.run_task(
+                                            self._remove_groq_api_key,
+                                            groq_key_status,
+                                        ),
+                                    ),
+                                ],
+                                wrap=True,
+                            ),
+                            ft.Text(
+                                "A key stored in an APK is not secret from someone "
+                                "who controls or extracts data from that device. "
+                                "Do not ship an APK with your own key preloaded.",
+                                size=12,
+                                color=self._secondary_text_color(),
+                            ),
+                        ],
+                        spacing=6,
+                    ),
+                    padding=14,
+                    bgcolor=self._surface_color(),
+                    border_radius=12,
+                ),
                 ft.Container(
                     content=ft.Column(
                         controls=[
@@ -1945,6 +2999,109 @@ class StudyWorkspace:
             spacing=10,
             expand=True,
         )
+
+    async def _clear_study_cache(self) -> None:
+        session = self.auth.session
+        if (
+            session is None
+            or self._cache_clear_in_progress
+            or self._data_loading
+        ):
+            return
+
+        self._cache_clear_in_progress = True
+        self._cache_clear_status = "Refreshing study data before clearing the saved snapshot..."
+        self._render(session)
+        try:
+            await self.show(self.route, refresh=True)
+            if self.auth.session is None or self.auth.session.uid != session.uid:
+                return
+            if self._offline_mode or self.firestore.offline:
+                self._cache_clear_status = (
+                    "Offline: saved study data was kept. Try again when online."
+                )
+            elif self._data_error or not self._data_available:
+                self._cache_clear_status = (
+                    "Could not refresh study data; the saved cache was kept."
+                )
+            elif self._safe_disposable_cache_cleanup(uid=session.uid):
+                self._cache_clear_status = (
+                    "Cache cleared. Your refreshed tasks and subjects remain available."
+                )
+            else:
+                self._cache_clear_status = (
+                    "Could not clear the saved cache. Your refreshed data remains available."
+                )
+        except Exception:
+            logger.exception("Could not refresh and clear the study cache from Settings.")
+            self._cache_clear_status = (
+                "Could not clear the saved cache. Your study data was kept."
+            )
+        finally:
+            self._cache_clear_in_progress = False
+            if self.auth.session is not None and self.auth.session.uid == session.uid:
+                self._render(self.auth.session)
+
+    async def _save_groq_api_key(
+        self, control: ft.TextField, status: ft.Text
+    ) -> None:
+        try:
+            save_groq_api_key(control.value or "")
+        except ValueError as error:
+            status.value = str(error)
+            self.page.update()
+            return
+        except OSError:
+            logger.exception("Could not save the Groq API key from Settings.")
+            status.value = "Could not save the key in this device's app storage."
+            self.page.update()
+            return
+        control.value = ""
+        status.value = groq_api_key_source()
+        self.page.update()
+
+    async def _remove_groq_api_key(self, status: ft.Text) -> None:
+        try:
+            clear_saved_groq_api_key()
+        except OSError:
+            logger.exception("Could not remove the saved Groq API key from Settings.")
+            status.value = "Could not remove the saved Groq key."
+            self.page.update()
+            return
+        status.value = groq_api_key_source()
+        self.page.update()
+
+    async def _set_notification_preference(self, field: str, event: Any) -> None:
+        session = self.auth.session
+        if session is None or field not in {
+            "enabled",
+            "reminder_24_hours",
+            "reminder_1_hour",
+            "overdue_alert",
+        }:
+            return
+        current = self.notifications.get_preferences(session.uid)
+        preferences = replace(current, **{field: bool(event.control.value)})
+        self.notifications.save_preferences(session.uid, preferences)
+        notice = ""
+        if field == "enabled" and preferences.enabled:
+            permission = await self.notifications.permission_granted()
+            if permission is not True:
+                permission = await self.notifications.request_permission()
+            self._notification_permission = permission
+            if permission is False:
+                notice = (
+                    "Notifications remain enabled in the app, but Android permission "
+                    "is denied."
+                )
+        await self._reconcile_notifications()
+        self._render(session, notice=notice)
+
+    async def _open_notification_settings(self) -> None:
+        await self.notifications.open_permission_settings()
+        self._notification_permission = await self.notifications.permission_granted()
+        if self.auth.session is not None:
+            self._render(self.auth.session)
 
     def _set_dark_mode(self, event: Any) -> None:
         self.dark_mode = bool(event.control.value)

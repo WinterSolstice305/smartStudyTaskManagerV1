@@ -14,8 +14,8 @@ This repository is a compact Python/Flet application. The significant runtime co
 ├── functions/
 │   ├── index.js
 │   ├── package.json
-│   ├── src/gemini.js
-│   └── test/gemini.test.js
+│   ├── src/groq.js
+│   └── test/groq.test.js
 ├── main.py
 ├── package.json
 ├── pyproject.toml
@@ -29,10 +29,12 @@ This repository is a compact Python/Flet application. The significant runtime co
 │   │   ├── subject.py
 │   │   └── task.py
 │   ├── services/
+│   │   ├── ai_config.py
 │   │   ├── __init__.py
 │   │   ├── firebase_auth.py
 │   │   ├── firestore.py
-│   │   ├── gemini.py
+│   │   ├── groq.py
+│   │   ├── notifications.py
 │   │   ├── study_cache.py
 │   │   ├── subject_service.py
 │   │   └── task_service.py
@@ -49,7 +51,7 @@ This repository is a compact Python/Flet application. The significant runtime co
 │   ├── firestore_rules.test.mjs
 │   ├── test_firebase_auth.py
 │   ├── test_firestore.py
-│   ├── test_gemini.py
+│   ├── test_groq.py
 │   ├── test_models_services.py
 │   └── test_task_views.py
 └── docs/
@@ -82,7 +84,7 @@ Declares the Python project metadata and an upper-level requirement of `>=3.14`.
 The Python dependency manifest used for standard installation. It includes:
 
 - `flet>=1.0.4`
-- `google-genai>=1.0.0,<3.0.0`
+- `httpx>=0.27,<1`
 - `python-dotenv>=1.0.0,<2.0.0`
 
 ### `firebase.json`
@@ -107,7 +109,7 @@ Sanitized template for required environment variables.
 
 ### `app/config.py`
 
-Reads Firebase and Gemini environment variables. It also contains default placeholder values, which should not be treated as production-safe configuration.
+Reads Firebase and Groq environment variables. It also contains default placeholder values, which should not be treated as production-safe configuration.
 
 ### `app/models/`
 
@@ -162,19 +164,31 @@ A service wrapper around subjects. It validates updates, checks for task referen
 
 A service wrapper for task CRUD. It ensures the assigned subject exists when creating or reassigning a task, performs update validation, and leaves `updated_at` in sync.
 
-### `app/services/gemini.py`
+### `app/services/notifications.py`
+
+Reconciles task notification preferences with Android-local scheduled events.
+Stable IDs and app-private state support idempotent rescheduling and removal
+when tasks change, complete, or are deleted. Deadline-time events require the
+task's `alarm_enabled` preference as well as the Settings notification options.
+
+### `app/services/groq.py`
 
 Implements the AI planner functionality. It contains:
 
 - `generate_task_recommendations()`
 - `chat_about_tasks()`
-- Gemini request formatting and error handling
+- Groq request formatting and error handling
 - local deadline sorting utilities
 
-By default it sends authenticated requests to `generateGemini` in Firebase
-Cloud Functions. `GEMINI_BACKEND_URL=direct` is a local-development escape
-hatch that calls Google directly with `GEMINI_API_KEY`. Both modes are
-read-only with respect to the client task data.
+It sends direct Groq Chat Completions requests in both desktop and Android
+builds. `GROQ_API_KEY` comes from the repository-root `.env` or the key saved
+in app-private storage through Settings on Android. AI does not depend on
+Firebase Cloud Functions.
+
+### `app/services/ai_config.py`
+
+Loads the repository-root `.env`, resolves the direct-mode Groq key, and
+persists an Android user's key in the Flet app-private data directory.
 
 ### `app/services/study_cache.py`
 
@@ -220,15 +234,13 @@ creation and reports permission failures without exposing credentials.
 
 ### `functions/index.js`
 
-Exports the HTTPS `generateGemini` Cloud Function in `us-central1`. It verifies
-the caller's Firebase ID token, validates the request, reads `GEMINI_API_KEY`
-from a Firebase secret, calls Gemini, and enforces a 30-request-per-user UTC
-day limit using the Admin SDK.
+Contains an optional authenticated `generateGroq` proxy, but the Python client
+does not call it. Deploying Cloud Functions is not required for AI requests.
 
-### `functions/src/gemini.js`
+### `functions/src/groq.js`
 
-Contains request-size validation and Gemini error classification used by the
-function. `functions/test/gemini.test.js` exercises these helpers.
+Contains request-size validation and Groq error classification used by the
+function. `functions/test/groq.test.js` exercises these helpers.
 
 ### `app/ui/home.py`
 
@@ -242,7 +254,7 @@ The repo contains Python unit tests and a Firestore security rules test.
 
 - `test_firebase_auth.py` verifies auth translation and token storage.
 - `test_firestore.py` verifies Firestore request scoping, malformed responses, and permission checks.
-- `test_gemini.py` verifies AI prompt context, rate-limit handling, and read-only behavior.
+- `test_groq.py` verifies AI prompt context, rate-limit handling, and read-only behavior.
 - `test_models_services.py` verifies `Subject` and `Task` validation and CRUD logic.
 - `test_task_views.py` validates sorting/filtering utilities.
 - `test_workspace_ui.py` validates workspace loading, cache, calendar, and

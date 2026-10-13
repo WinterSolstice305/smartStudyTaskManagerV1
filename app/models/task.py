@@ -24,6 +24,7 @@ class Task:
     tags: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=now_utc)
     updated_at: datetime = field(default_factory=now_utc)
+    alarm_enabled: bool = False
 
     def __post_init__(self) -> None:
         require_text(self.id, "id")
@@ -34,6 +35,8 @@ class Task:
         require_text(self.priority, "priority")
         require_text(self.category, "category")
         require_text(self.status, "status")
+        if not isinstance(self.alarm_enabled, bool):
+            raise ModelValidationError("alarm_enabled must be a boolean.")
         if not isinstance(self.tags, list) or any(
             not isinstance(tag, str) for tag in self.tags
         ):
@@ -59,6 +62,7 @@ class Task:
             "category": self.category,
             "status": self.status,
             "tags": list(self.tags),
+            "alarm_enabled": self.alarm_enabled,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
@@ -71,13 +75,16 @@ class Task:
             return cls(
                 id=document_id,
                 title=data["title"],
-                deadline=data["deadline"],
+                # Deadline is optional; older records may omit the field.
+                deadline=data.get("deadline"),
                 description=data.get("description", ""),
                 subject_id=data.get("subject_id"),
                 priority=data.get("priority", "medium"),
                 category=data.get("category", "general"),
                 status=data.get("status", "pending"),
                 tags=data.get("tags", []),
+                # Historical tasks remain opted out; new tasks opt in via create_task.
+                alarm_enabled=data.get("alarm_enabled", False),
                 created_at=data["created_at"],
                 updated_at=data["updated_at"],
             )
